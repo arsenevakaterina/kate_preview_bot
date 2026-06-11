@@ -1,0 +1,457 @@
+"""Adstail creative-upload bot — throwaway prototype.
+
+Prototypes the creative-upload UX. No real backend, no file storage —
+all state lives in memory (a dict keyed by user_id). Telegram constraints
+are reproduced faithfully: media groups carry no inline keyboard, the draft
+panel is a SEPARATE text message edited in place, albums are debounced.
+
+Run:
+    pip install aiogram
+    BOT_TOKEN=... python bot.py
+Optional: TARGET_CHAT_ID=... (where "upload" sends the post; default = same chat)
+"""
+
+import asyncio
+import logging
+import os
+from collections import deque
+from typing import Awaitable, Callable, Optional
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("creativebot")
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    MenuButtonCommands,
+    Message,
+)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+TARGET_CHAT_ID_RAW = os.environ.get("TARGET_CHAT_ID")
+TARGET_CHAT_ID: Optional[int] = int(TARGET_CHAT_ID_RAW) if TARGET_CHAT_ID_RAW else None
+
+MAX_MEDIA = 10
+CAPTION_LIMIT = 1024
+ALBUM_DEBOUNCE = 1.0  # seconds
+
+# ---------------------------------------------------------------------------
+# UI strings (all English, final — per spec)
+# ---------------------------------------------------------------------------
+
+S = {
+    "start.intro": (
+        "🤖 Бот для тестирования сценариев и сообщений.\n\n"
+        "Выберите команду, запускающую флоу."
+    ),
+    "panel.title": '📤 New creative for kate_test_channel_mar26 (campaign "Ттт")',
+    "hint.empty": (
+        "Send photos, videos and text — together or one at a time.\n"
+        "📎 Media is added in the order you send it.\n"
+        "✏️ Sending new text replaces the current caption."
+    ),
+    "hint.need_text": "Add text — it will become the caption.",
+    "hint.need_media": "Now send a photo or video.",
+    "hint.ready": "Ready to upload.",
+    "btn.confirm": "✅ Confirm and upload",
+    "btn.preview": "👁 Show preview",
+    "btn.restart": "↻ Start over",
+    "btn.cancel": "✖️ Cancel",
+    "btn.new": "➕ New creative",
+    "preview.header": "☝️ This is exactly how the post will look.",
+    "err.too_long": "Text is too long for a media caption (max 1024 chars). Please shorten it.",
+    "err.album_full": 'Album is full — 10 is Telegram\'s max. Use "Start over" to change the set.',
+    "err.unsupported": "Only photos and videos are accepted here.",
+    "success": "✅ Done! Creative uploaded to kate_test_channel_mar26.",
+    "canceled": "Upload canceled.",
+}
+
+# ---------------------------------------------------------------------------
+# State — per-user, in memory
+# ---------------------------------------------------------------------------
+
+# user_id -> draft dict
+drafts: dict[int, dict] = {}
+
+
+def new_draft() -> dict:
+    return {
+        "media": [],            # list[{type, file_id}], max 10
+        "text": None,           # caption
+        "panel_msg_id": None,   # the draft panel message we edit in place
+        "preview_msg_ids": [],  # ids of last preview album (to delete)
+        "album_buffer": None,   # {media_group_id, items, task}
+        "stage": "composing",   # composing | done | canceled
+    }
+
+
+def get_draft(user_id: int) -> dict:
+    d = drafts.get(user_id)
+    if d is None:
+        d = new_draft()
+        drafts[user_id] = d
+    return d
+
+
+def is_ready(d: dict) -> bool:
+    return (
+        len(d["media"]) >= 1
+        and d["text"] is not None
+        and len(d["text"]) <= CAPTION_LIMIT
+    )
+
+
+# ---------------------------------------------------------------------------
+# Panel rendering
+# ---------------------------------------------------------------------------
+
+def panel_text(d: dict, header: Optional[str] = None) -> str:
+    n = len(d["media"])
+    has_text = d["text"] is not None
+    counter = f"Media: {n}/10 · Text: {'✓' if has_text else '—'}"
+
+    if n == 0 and not has_text:
+        hint = S["hint.empty"]
+    elif n >= 1 and not has_text:
+        hint = S["hint.need_text"]
+    elif n == 0 and has_text:
+        hint = S["hint.need_media"]
+    else:
+        hint = S["hint.ready"]
+
+    title = S["panel.title"]
+    body = f"{title}\n\n{counter}\n{hint}"
+    if header:
+        body = f"{header}\n\n{body}"
+    return body
+
+
+def panel_keyboard(d: dict) -> InlineKeyboardMarkup:
+    rows = []
+    if is_ready(d):
+        rows.append([InlineKeyboardButton(text=S["btn.confirm"], callback_data="confirm")])
+    if len(d["media"]) >= 1 or d["text"] is not None:
+        rows.append([InlineKeyboardButton(text=S["btn.preview"], callback_data="preview")])
+    if len(d["media"]) >= 1 or d["text"] is not None:
+        rows.append([InlineKeyboardButton(text=S["btn.restart"], callback_data="restart")])
+    rows.append([InlineKeyboardButton(text=S["btn.cancel"], callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def edit_panel(bot: Bot, chat_id: int, d: dict, header: Optional[str] = None) -> None:
+    """Edit the existing panel in place. Never sends a new panel."""
+    if d["panel_msg_id"] is None:
+        return
+    try:
+        await bot.edit_message_text(
+            text=panel_text(d, header),
+            chat_id=chat_id,
+            message_id=d["panel_msg_id"],
+            reply_markup=panel_keyboard(d),
+        )
+    except TelegramBadRequest:
+        # "message is not modified" or similar — safe to ignore for a prototype.
+        pass
+
+
+async def send_panel(bot: Bot, chat_id: int, d: dict, header: Optional[str] = None) -> None:
+    """Send a fresh panel and store its id (entry, or after a preview album)."""
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=panel_text(d, header),
+        reply_markup=panel_keyboard(d),
+    )
+    d["panel_msg_id"] = msg.message_id
+
+
+# ---------------------------------------------------------------------------
+# Media helpers
+# ---------------------------------------------------------------------------
+
+def media_group_with_caption(media: list[dict], caption: Optional[str]) -> list:
+    out = []
+    for i, item in enumerate(media):
+        cap = caption if i == 0 else None
+        if item["type"] == "photo":
+            out.append(InputMediaPhoto(media=item["file_id"], caption=cap))
+        else:
+            out.append(InputMediaVideo(media=item["file_id"], caption=cap))
+    return out
+
+
+async def delete_preview(bot: Bot, chat_id: int, d: dict) -> None:
+    for mid in d["preview_msg_ids"]:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except TelegramBadRequest:
+            pass
+    d["preview_msg_ids"] = []
+
+
+# ---------------------------------------------------------------------------
+# Bot / Dispatcher
+# ---------------------------------------------------------------------------
+
+dp = Dispatcher()
+
+# Telegram can deliver the same callback_query more than once. Remember recently
+# seen callback ids and drop repeats so one tap never fires a handler twice.
+_seen_cb_ids: deque[str] = deque(maxlen=256)
+
+
+@dp.callback_query.outer_middleware
+async def dedup_callbacks(
+    handler: Callable[[CallbackQuery, dict], Awaitable],
+    event: CallbackQuery,
+    data: dict,
+):
+    if event.id in _seen_cb_ids:
+        log.info("DUP callback dropped: id=%s data=%s", event.id, event.data)
+        await event.answer()
+        return None
+    _seen_cb_ids.append(event.id)
+    return await handler(event, data)
+
+
+@dp.message(CommandStart())
+async def on_start(message: Message, bot: Bot) -> None:
+    await message.answer(S["start.intro"])
+
+
+@dp.message(Command("creative"))
+async def on_creative(message: Message, bot: Bot) -> None:
+    d = new_draft()
+    drafts[message.from_user.id] = d
+    await send_panel(bot, message.chat.id, d)
+
+
+# --- album debounce -------------------------------------------------------
+
+async def flush_album(bot: Bot, chat_id: int, user_id: int) -> None:
+    """Fires after debounce window; appends all buffered album items at once."""
+    await asyncio.sleep(ALBUM_DEBOUNCE)
+    d = get_draft(user_id)
+    buf = d["album_buffer"]
+    if not buf:
+        return
+    items = buf["items"]
+    d["album_buffer"] = None
+
+    overflowed = False
+    for item in items:
+        if len(d["media"]) >= MAX_MEDIA:
+            overflowed = True
+            break
+        d["media"].append(item)
+
+    await edit_panel(bot, chat_id, d)
+    if overflowed:
+        # Best-effort notice; album messages have no callback to answer, so send text.
+        try:
+            await bot.send_message(chat_id, S["err.album_full"])
+        except TelegramBadRequest:
+            pass
+
+
+@dp.message(F.media_group_id, F.photo | F.video)
+async def on_album_item(message: Message, bot: Bot) -> None:
+    d = get_draft(message.from_user.id)
+    if d["stage"] != "composing":
+        return
+
+    if message.photo:
+        item = {"type": "photo", "file_id": message.photo[-1].file_id}
+    else:
+        item = {"type": "video", "file_id": message.video.file_id}
+
+    buf = d["album_buffer"]
+    if buf and buf["media_group_id"] == message.media_group_id:
+        buf["items"].append(item)
+        # restart debounce
+        buf["task"].cancel()
+    else:
+        buf = {"media_group_id": message.media_group_id, "items": [item], "task": None}
+        d["album_buffer"] = buf
+
+    buf["task"] = asyncio.create_task(
+        flush_album(bot, message.chat.id, message.from_user.id)
+    )
+
+
+@dp.message(F.photo | F.video)
+async def on_single_media(message: Message, bot: Bot) -> None:
+    d = get_draft(message.from_user.id)
+    if d["stage"] != "composing":
+        return
+
+    if message.photo:
+        item = {"type": "photo", "file_id": message.photo[-1].file_id}
+    else:
+        item = {"type": "video", "file_id": message.video.file_id}
+
+    if len(d["media"]) >= MAX_MEDIA:
+        await message.answer(S["err.album_full"])
+        return
+
+    d["media"].append(item)
+    await edit_panel(bot, message.chat.id, d)
+
+
+@dp.message(F.text)
+async def on_text(message: Message, bot: Bot) -> None:
+    d = get_draft(message.from_user.id)
+    if d["stage"] != "composing":
+        return
+
+    text = message.text
+    if len(text) > CAPTION_LIMIT:
+        await message.answer(S["err.too_long"])
+        return
+
+    d["text"] = text
+    await edit_panel(bot, message.chat.id, d)
+
+
+@dp.message()
+async def on_unsupported(message: Message, bot: Bot) -> None:
+    d = get_draft(message.from_user.id)
+    if d["stage"] != "composing":
+        return
+    await message.answer(S["err.unsupported"])
+
+
+# --- callbacks ------------------------------------------------------------
+
+@dp.callback_query(F.data == "preview")
+async def cb_preview(cq: CallbackQuery, bot: Bot) -> None:
+    d = get_draft(cq.from_user.id)
+    await cq.answer()
+    if d["stage"] != "composing" or (len(d["media"]) < 1 and d["text"] is None):
+        return
+
+    chat_id = cq.message.chat.id
+    old_panel_id = d["panel_msg_id"]
+    await delete_preview(bot, chat_id, d)
+
+    if d["media"]:
+        sent = await bot.send_media_group(
+            chat_id=chat_id,
+            media=media_group_with_caption(d["media"], d["text"]),
+        )
+        d["preview_msg_ids"] = [m.message_id for m in sent]
+    else:
+        # Text-only preview: just the plain message, exactly as it would post.
+        sent = await bot.send_message(chat_id, d["text"])
+        d["preview_msg_ids"] = [sent.message_id]
+
+    # The old panel is now scrolled above the preview — send a FRESH panel below
+    # and point panel_msg_id at it, then remove the old panel so only ONE
+    # interactive panel ever exists (stale panels would pile up duplicate previews).
+    await send_panel(bot, chat_id, d, header=S["preview.header"])
+    if old_panel_id is not None:
+        try:
+            await bot.delete_message(chat_id, old_panel_id)
+        except TelegramBadRequest:
+            pass
+
+
+@dp.callback_query(F.data == "confirm")
+async def cb_confirm(cq: CallbackQuery, bot: Bot) -> None:
+    d = get_draft(cq.from_user.id)
+    await cq.answer()
+    if not is_ready(d) or d["stage"] != "composing":
+        return
+
+    chat_id = cq.message.chat.id
+    target = TARGET_CHAT_ID if TARGET_CHAT_ID is not None else chat_id
+    await bot.send_media_group(
+        chat_id=target,
+        media=media_group_with_caption(d["media"], d["text"]),
+    )
+
+    d["stage"] = "done"
+    n = len(d["media"])
+    success_body = f"{S['success']}\n\n{n} media · caption attached"
+    try:
+        await bot.edit_message_text(
+            text=success_body,
+            chat_id=chat_id,
+            message_id=d["panel_msg_id"],
+            reply_markup=None,
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data == "restart")
+async def cb_restart(cq: CallbackQuery, bot: Bot) -> None:
+    d = get_draft(cq.from_user.id)
+    await cq.answer()
+    chat_id = cq.message.chat.id
+    await delete_preview(bot, chat_id, d)
+    d["media"] = []
+    d["text"] = None
+    d["album_buffer"] = None
+    await edit_panel(bot, chat_id, d)
+
+
+@dp.callback_query(F.data == "cancel")
+async def cb_cancel(cq: CallbackQuery, bot: Bot) -> None:
+    d = get_draft(cq.from_user.id)
+    await cq.answer()
+    chat_id = cq.message.chat.id
+    await delete_preview(bot, chat_id, d)
+    d["stage"] = "canceled"
+    try:
+        await bot.edit_message_text(
+            text=S["canceled"],
+            chat_id=chat_id,
+            message_id=d["panel_msg_id"],
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text=S["btn.new"], callback_data="new")]]
+            ),
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data == "new")
+async def cb_new(cq: CallbackQuery, bot: Bot) -> None:
+    await cq.answer()
+    d = new_draft()
+    drafts[cq.from_user.id] = d
+    await send_panel(bot, cq.message.chat.id, d)
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+async def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN env var is required. Run: BOT_TOKEN=... python bot.py")
+    bot = Bot(BOT_TOKEN)
+    await bot.set_my_commands(
+        [
+            BotCommand(command="creative", description="тест флоу добавления креатива"),
+        ]
+    )
+    # Make the chat "Menu" button open the commands list.
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    # Drop any backlog so a previously-conflicting poller can't replay updates.
+    await dp.start_polling(bot, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
