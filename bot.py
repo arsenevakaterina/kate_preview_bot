@@ -218,7 +218,6 @@ async def dedup_callbacks(
     event: CallbackQuery,
     data: dict,
 ):
-    log.info("CB recv: instance=%s id=%s data=%s", INSTANCE, event.id, event.data)
     if event.id in _seen_cb_ids:
         log.info("DUP dropped: instance=%s id=%s data=%s", INSTANCE, event.id, event.data)
         await event.answer()
