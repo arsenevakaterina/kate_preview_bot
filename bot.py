@@ -14,11 +14,17 @@ Optional: TARGET_CHAT_ID=... (where "upload" sends the post; default = same chat
 import asyncio
 import logging
 import os
+import uuid
 from collections import deque
 from typing import Awaitable, Callable, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("creativebot")
+
+# Unique per-process id — lets us tell in the logs whether two updates were
+# handled by the SAME instance (Telegram double-delivery) or DIFFERENT instances
+# (more than one poller running, which in-memory dedup can't fix).
+INSTANCE = uuid.uuid4().hex[:8]
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
@@ -212,8 +218,9 @@ async def dedup_callbacks(
     event: CallbackQuery,
     data: dict,
 ):
+    log.info("CB recv: instance=%s id=%s data=%s", INSTANCE, event.id, event.data)
     if event.id in _seen_cb_ids:
-        log.info("DUP callback dropped: id=%s data=%s", event.id, event.data)
+        log.info("DUP dropped: instance=%s id=%s data=%s", INSTANCE, event.id, event.data)
         await event.answer()
         return None
     _seen_cb_ids.append(event.id)
@@ -442,6 +449,7 @@ async def cb_new(cq: CallbackQuery, bot: Bot) -> None:
 async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN env var is required. Run: BOT_TOKEN=... python bot.py")
+    log.info("BOOT instance=%s starting polling", INSTANCE)
     bot = Bot(BOT_TOKEN)
     await bot.set_my_commands(
         [
