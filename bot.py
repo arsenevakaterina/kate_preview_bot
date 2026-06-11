@@ -105,11 +105,8 @@ def get_draft(user_id: int) -> dict:
 
 
 def is_ready(d: dict) -> bool:
-    return (
-        len(d["media"]) >= 1
-        and d["text"] is not None
-        and len(d["text"]) <= CAPTION_LIMIT
-    )
+    # Text alone is enough to upload; media is optional.
+    return d["text"] is not None and len(d["text"]) <= CAPTION_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -121,14 +118,13 @@ def panel_text(d: dict, header: Optional[str] = None) -> str:
     has_text = d["text"] is not None
     counter = f"Media: {n}/10 · Text: {'✓' if has_text else '—'}"
 
-    if n == 0 and not has_text:
-        hint = S["hint.empty"]
-    elif n >= 1 and not has_text:
-        hint = S["hint.need_text"]
-    elif n == 0 and has_text:
-        hint = S["hint.need_media"]
-    else:
+    if has_text:
+        # Text present → ready (with or without media).
         hint = S["hint.ready"]
+    elif n >= 1:
+        hint = S["hint.need_text"]
+    else:
+        hint = S["hint.empty"]
 
     title = S["panel.title"]
     body = f"{title}\n\n{counter}\n{hint}"
@@ -375,14 +371,19 @@ async def cb_confirm(cq: CallbackQuery, bot: Bot) -> None:
 
     chat_id = cq.message.chat.id
     target = TARGET_CHAT_ID if TARGET_CHAT_ID is not None else chat_id
-    await bot.send_media_group(
-        chat_id=target,
-        media=media_group_with_caption(d["media"], d["text"]),
-    )
+    if d["media"]:
+        await bot.send_media_group(
+            chat_id=target,
+            media=media_group_with_caption(d["media"], d["text"]),
+        )
+    else:
+        # Text-only creative: post as a plain message.
+        await bot.send_message(chat_id=target, text=d["text"])
 
     d["stage"] = "done"
     n = len(d["media"])
-    success_body = f"{S['success']}\n\n{n} media · caption attached"
+    detail = f"{n} media · caption attached" if n else "text only"
+    success_body = f"{S['success']}\n\n{detail}"
     try:
         await bot.edit_message_text(
             text=success_body,
