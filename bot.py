@@ -177,6 +177,23 @@ async def send_panel(bot: Bot, chat_id: int, d: dict, header: Optional[str] = No
     d["panel_msg_id"] = msg.message_id
 
 
+async def refresh_panel(bot: Bot, chat_id: int, d: dict, header: Optional[str] = None) -> None:
+    """React to a user *message* with a fresh panel below it, then drop the old one.
+
+    Editing the panel in place (edit_panel) is invisible to users: their message
+    gets no apparent reply and the panel silently mutates somewhere above. So for
+    every incoming message we send a NEW panel (a clear reply with buttons) and
+    delete the previous one, keeping exactly ONE interactive panel alive.
+    """
+    old_panel_id = d["panel_msg_id"]
+    await send_panel(bot, chat_id, d, header)
+    if old_panel_id is not None and old_panel_id != d["panel_msg_id"]:
+        try:
+            await bot.delete_message(chat_id, old_panel_id)
+        except TelegramBadRequest:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Media helpers
 # ---------------------------------------------------------------------------
@@ -257,7 +274,7 @@ async def flush_album(bot: Bot, chat_id: int, user_id: int) -> None:
             break
         d["media"].append(item)
 
-    await edit_panel(bot, chat_id, d)
+    await refresh_panel(bot, chat_id, d)
     if overflowed:
         # Best-effort notice; album messages have no callback to answer, so send text.
         try:
@@ -307,7 +324,7 @@ async def on_single_media(message: Message, bot: Bot) -> None:
         return
 
     d["media"].append(item)
-    await edit_panel(bot, message.chat.id, d)
+    await refresh_panel(bot, message.chat.id, d)
 
 
 @dp.message(F.text)
@@ -322,7 +339,7 @@ async def on_text(message: Message, bot: Bot) -> None:
         return
 
     d["text"] = text
-    await edit_panel(bot, message.chat.id, d)
+    await refresh_panel(bot, message.chat.id, d)
 
 
 @dp.message()
