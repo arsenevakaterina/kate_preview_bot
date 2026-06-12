@@ -63,18 +63,16 @@ S = {
         "Выберите команду, запускающую флоу."
     ),
     "panel.title": '📤 New creative for kate_test_channel_mar26 (campaign "Ттт")',
-    "hint.empty": (
-        "Send photos, videos and text — together or one at a time.\n"
-        "📎 Media is added in the order you send it.\n"
-        "✏️ Sending new text replaces the current caption."
+    "hint.edit": (
+        "Keep editing anytime — this draft stays open:\n"
+        "✏️ Send new text to replace the caption.\n"
+        "📎 Send photos or videos to add more media."
     ),
-    "hint.need_text": "Add text — it will become the caption.",
-    "hint.need_media": "Now send a photo or video.",
-    "hint.ready": "Ready to upload.",
+    "hint.ready": "✅ Ready to upload whenever you are.",
     "status.text_done": "✅ Text added",
     "status.text_todo": "❗️ Add text (required)",
     "status.media_done": "✅ Media added · {n}/10",
-    "status.media_todo": "⬜️ Add media (optional)",
+    "status.media_todo": "⬜️ Add media (optional) · {n}/10",
     "btn.confirm": "✅ Confirm and upload",
     "link.none": (
         "⚠️ No link found in your text.\n"
@@ -147,18 +145,18 @@ def panel_text(d: dict, header: Optional[str] = None) -> str:
     # only photos, the text line stays visible as a call to action. Text is
     # required to upload; media is optional.
     text_line = S["status.text_done"] if has_text else S["status.text_todo"]
-    media_line = S["status.media_done"].format(n=n) if n else S["status.media_todo"]
+    media_line = (S["status.media_done"] if n else S["status.media_todo"]).format(n=n)
     status = f"{text_line}\n{media_line}"
 
-    if has_text:
-        hint = S["hint.ready"]
-    elif n >= 1:
-        hint = S["hint.need_text"]
-    else:
-        hint = S["hint.empty"]
-
     title = S["panel.title"]
-    body = f"{status}\n\n{title}\n\n{hint}"
+    # The editing reminder is shown in EVERY state. Users were not realising the
+    # draft stays live after the first message — the panel read like a final
+    # "Ready to upload" screen — so the "keep sending to change it" guidance must
+    # never disappear. The readiness line is added on top only when ready.
+    parts = [status, title, S["hint.edit"]]
+    if has_text:
+        parts.append(S["hint.ready"])
+    body = "\n\n".join(parts)
     if header:
         body = f"{header}\n\n{body}"
     return body
