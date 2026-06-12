@@ -180,6 +180,36 @@ async def send_panel(bot: Bot, chat_id: int, d: dict, header: Optional[str] = No
     d["panel_msg_id"] = msg.message_id
 
 
+def compose_header(text_change: Optional[str], media_added: bool) -> Optional[str]:
+    """Build the panel's leading "what just happened" status from one message.
+
+    A single message can change both (media WITH a caption), so the header may
+    carry both ticks. text_change is None | "added" | "replaced".
+    """
+    lines = []
+    if text_change == "added":
+        lines.append(S["did.text_added"])
+    elif text_change == "replaced":
+        lines.append(S["did.text_replaced"])
+    if media_added:
+        lines.append(S["did.media_added"])
+    return "\n".join(lines) if lines else None
+
+
+def apply_caption(d: dict, caption: Optional[str]) -> Optional[str]:
+    """Process a media caption exactly like a text message: set it as the draft
+    caption (within the limit) and report the change ("added"/"replaced"/None).
+    Returns "too_long" if the caption overflows so the caller can warn the user.
+    """
+    if caption is None:
+        return None
+    if len(caption) > CAPTION_LIMIT:
+        return "too_long"
+    change = "replaced" if d["text"] is not None else "added"
+    d["text"] = caption
+    return change
+
+
 async def refresh_panel(bot: Bot, chat_id: int, d: dict, header: Optional[str] = None) -> None:
     """React to a user *message* with a fresh panel below it, then drop the old one.
 
@@ -271,7 +301,17 @@ async def flush_album(bot: Bot, chat_id: int, user_id: int) -> None:
     if not buf:
         return
     items = buf["items"]
+    caption = buf.get("caption")
     d["album_buffer"] = None
+
+    # Apply the album's caption as the draft text, same as a plain text message.
+    text_change = apply_caption(d, caption)
+    if text_change == "too_long":
+        try:
+            await bot.send_message(chat_id, S["err.too_long"])
+        except TelegramBadRequest:
+            pass
+        text_change = None
 
     overflowed = False
     added = 0
@@ -282,7 +322,7 @@ async def flush_album(bot: Bot, chat_id: int, user_id: int) -> None:
         d["media"].append(item)
         added += 1
 
-    await refresh_panel(bot, chat_id, d, header=S["did.media_added"] if added else None)
+    await refresh_panel(bot, chat_id, d, header=compose_header(text_change, added > 0))
     if overflowed:
         # Best-effort notice; album messages have no callback to answer, so send text.
         try:
@@ -302,13 +342,22 @@ async def on_album_item(message: Message, bot: Bot) -> None:
     else:
         item = {"type": "video", "file_id": message.video.file_id}
 
+    # An album's caption rides on one of its items (Telegram puts it on the
+    # first); capture whichever item carries it so flush can apply it as text.
     buf = d["album_buffer"]
     if buf and buf["media_group_id"] == message.media_group_id:
         buf["items"].append(item)
+        if message.caption is not None:
+            buf["caption"] = message.caption
         # restart debounce
         buf["task"].cancel()
     else:
-        buf = {"media_group_id": message.media_group_id, "items": [item], "task": None}
+        buf = {
+            "media_group_id": message.media_group_id,
+            "items": [item],
+            "caption": message.caption,
+            "task": None,
+        }
         d["album_buffer"] = buf
 
     buf["task"] = asyncio.create_task(
@@ -327,12 +376,25 @@ async def on_single_media(message: Message, bot: Bot) -> None:
     else:
         item = {"type": "video", "file_id": message.video.file_id}
 
+    # The caption travels with the media — process it just like a text message.
+    text_change = apply_caption(d, message.caption)
+    if text_change == "too_long":
+        await message.answer(S["err.too_long"])
+        text_change = None
+
+    media_added = False
     if len(d["media"]) >= MAX_MEDIA:
         await message.answer(S["err.album_full"])
-        return
+    else:
+        d["media"].append(item)
+        media_added = True
 
-    d["media"].append(item)
-    await refresh_panel(bot, message.chat.id, d, header=S["did.media_added"])
+    # Nothing landed (album full, no usable caption) → error already sent, no panel.
+    if not media_added and text_change is None:
+        return
+    await refresh_panel(
+        bot, message.chat.id, d, header=compose_header(text_change, media_added)
+    )
 
 
 @dp.message(F.text)
@@ -341,16 +403,12 @@ async def on_text(message: Message, bot: Bot) -> None:
     if d["stage"] != "composing":
         return
 
-    text = message.text
-    if len(text) > CAPTION_LIMIT:
+    text_change = apply_caption(d, message.text)
+    if text_change == "too_long":
         await message.answer(S["err.too_long"])
         return
-
-    replaced = d["text"] is not None
-    d["text"] = text
     await refresh_panel(
-        bot, message.chat.id, d,
-        header=S["did.text_replaced"] if replaced else S["did.text_added"],
+        bot, message.chat.id, d, header=compose_header(text_change, False)
     )
 
 
