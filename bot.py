@@ -14,6 +14,7 @@ Optional: TARGET_CHAT_ID=... (where "upload" sends the post; default = same chat
 import asyncio
 import logging
 import os
+import re
 import uuid
 from collections import deque
 from typing import Awaitable, Callable, Optional
@@ -75,6 +76,18 @@ S = {
     "status.media_done": "✅ Media added · {n}/10",
     "status.media_todo": "⬜️ Add media (optional)",
     "btn.confirm": "✅ Confirm and upload",
+    "link.none": (
+        "⚠️ No link found in your text.\n"
+        "Your ad will be uploaded without a target link. Continue?"
+    ),
+    "link.one": "🎯 This link will be your ad's target link:",
+    "link.choose": "🔗 Several links found — pick the one to use as the ad's target link:",
+    "link.picked": "🎯 This link will be your ad's target link:",
+    "btn.upload_nolink": "⬆️ Upload without a link",
+    "btn.upload": "⬆️ Confirm & upload",
+    "btn.back": "↩️ Back to editing",
+    "detail.target": "🎯 target link: {url}",
+    "detail.no_target": "🎯 no target link",
     "btn.preview": "👁 Show preview",
     "btn.restart": "↻ Start over",
     "btn.cancel": "✖️ Cancel",
@@ -103,6 +116,8 @@ def new_draft() -> dict:
         "preview_msg_ids": [],  # ids of last preview album (to delete)
         "album_buffer": None,   # {media_group_id, items, task}
         "stage": "composing",   # composing | done | canceled
+        "pending_links": [],    # links found in text at the upload gate
+        "target_link": None,    # the chosen target link (or None = no link)
     }
 
 
@@ -243,6 +258,77 @@ async def delete_preview(bot: Bot, chat_id: int, d: dict) -> None:
         except TelegramBadRequest:
             pass
     d["preview_msg_ids"] = []
+
+
+# ---------------------------------------------------------------------------
+# Target-link gate — the user must explicitly accept the target link (or its
+# absence) before the final upload.
+# ---------------------------------------------------------------------------
+
+# http(s):// or www. URLs; stop at whitespace/quotes/brackets.
+_URL_RE = re.compile(r'(?:https?://|www\.)[^\s<>"\')]+', re.IGNORECASE)
+
+
+def extract_links(text: Optional[str]) -> list[str]:
+    """Pull candidate links out of the caption text, de-duplicated, in order.
+
+    Plain-text scan (the draft keeps no entities) — good enough for visible
+    URLs; hidden text_link hyperlinks are out of scope for this prototype.
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    for raw in _URL_RE.findall(text):
+        url = raw.rstrip('.,;:!?)»"\'')
+        if url and url not in out:
+            out.append(url)
+    return out
+
+
+def _short_url(url: str, limit: int = 45) -> str:
+    return url if len(url) <= limit else url[: limit - 1] + "…"
+
+
+async def _edit_gate(bot: Bot, chat_id: int, d: dict, text: str, kb: InlineKeyboardMarkup) -> None:
+    """Render an arbitrary text+keyboard onto the existing panel in place."""
+    if d["panel_msg_id"] is None:
+        return
+    try:
+        await bot.edit_message_text(
+            text=text, chat_id=chat_id, message_id=d["panel_msg_id"], reply_markup=kb
+        )
+    except TelegramBadRequest:
+        pass
+
+
+def _confirm_kb(upload_label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=upload_label, callback_data="upload")],
+        [InlineKeyboardButton(text=S["btn.back"], callback_data="back")],
+    ])
+
+
+async def show_link_gate(bot: Bot, chat_id: int, d: dict) -> None:
+    """Tapping 'Confirm and upload' lands here: force an explicit decision about
+    the target link before the real upload runs."""
+    links = extract_links(d["text"])
+    d["pending_links"] = links
+
+    if len(links) == 0:
+        d["target_link"] = None
+        await _edit_gate(bot, chat_id, d, S["link.none"], _confirm_kb(S["btn.upload_nolink"]))
+    elif len(links) == 1:
+        d["target_link"] = links[0]
+        text = f"{S['link.one']}\n{links[0]}"
+        await _edit_gate(bot, chat_id, d, text, _confirm_kb(S["btn.upload"]))
+    else:
+        d["target_link"] = None
+        rows = [
+            [InlineKeyboardButton(text=_short_url(u), callback_data=f"pick:{i}")]
+            for i, u in enumerate(links)
+        ]
+        rows.append([InlineKeyboardButton(text=S["btn.back"], callback_data="back")])
+        await _edit_gate(bot, chat_id, d, S["link.choose"], InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +525,48 @@ async def cb_preview(cq: CallbackQuery, bot: Bot) -> None:
 
 @dp.callback_query(F.data == "confirm")
 async def cb_confirm(cq: CallbackQuery, bot: Bot) -> None:
+    # Step 1 of upload: don't post yet — make the user accept the target link.
+    d = get_draft(cq.from_user.id)
+    await cq.answer()
+    if not is_ready(d) or d["stage"] != "composing":
+        return
+    await show_link_gate(bot, cq.message.chat.id, d)
+
+
+@dp.callback_query(F.data.startswith("pick:"))
+async def cb_pick(cq: CallbackQuery, bot: Bot) -> None:
+    # User chose which of several links becomes the target → confirm that one.
+    d = get_draft(cq.from_user.id)
+    await cq.answer()
+    if d["stage"] != "composing":
+        return
+    try:
+        idx = int(cq.data.split(":", 1)[1])
+    except ValueError:
+        return
+    links = d.get("pending_links") or []
+    if not (0 <= idx < len(links)):
+        return
+    d["target_link"] = links[idx]
+    text = f"{S['link.picked']}\n{links[idx]}"
+    await _edit_gate(bot, cq.message.chat.id, d, text, _confirm_kb(S["btn.upload"]))
+
+
+@dp.callback_query(F.data == "back")
+async def cb_back(cq: CallbackQuery, bot: Bot) -> None:
+    # Leave the link gate, back to the editing panel.
+    d = get_draft(cq.from_user.id)
+    await cq.answer()
+    if d["stage"] != "composing":
+        return
+    d["pending_links"] = []
+    d["target_link"] = None
+    await edit_panel(bot, cq.message.chat.id, d)
+
+
+@dp.callback_query(F.data == "upload")
+async def cb_upload(cq: CallbackQuery, bot: Bot) -> None:
+    # Step 2 of upload: the target link is accepted — post for real.
     d = get_draft(cq.from_user.id)
     await cq.answer()
     if not is_ready(d) or d["stage"] != "composing":
@@ -457,8 +585,13 @@ async def cb_confirm(cq: CallbackQuery, bot: Bot) -> None:
 
     d["stage"] = "done"
     n = len(d["media"])
-    detail = f"{n} media · caption attached" if n else "text only"
-    success_body = f"{S['success']}\n\n{detail}"
+    media_detail = f"{n} media · caption attached" if n else "text only"
+    link_detail = (
+        S["detail.target"].format(url=d["target_link"])
+        if d["target_link"]
+        else S["detail.no_target"]
+    )
+    success_body = f"{S['success']}\n\n{media_detail}\n{link_detail}"
     try:
         await bot.edit_message_text(
             text=success_body,
@@ -479,6 +612,8 @@ async def cb_restart(cq: CallbackQuery, bot: Bot) -> None:
     d["media"] = []
     d["text"] = None
     d["album_buffer"] = None
+    d["pending_links"] = []
+    d["target_link"] = None
     await edit_panel(bot, chat_id, d)
 
 
