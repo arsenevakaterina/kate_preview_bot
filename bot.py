@@ -64,11 +64,11 @@ S = {
     ),
     "panel.title": '📤 New creative for kate_test_channel_mar26 (campaign "Ттт")',
     "hint.edit": (
-        "Keep editing anytime — this draft stays open:\n"
+        "This draft stays open:\n"
         "✏️ Send new text to replace the caption.\n"
         "📎 Send photos or videos to add more media."
     ),
-    "hint.ready": "✅ Ready to upload whenever you are.",
+    "hint.ready": "✅ Confirm and upload when ready.",
     "status.text_done": "✅ Text added",
     "status.text_todo": "❗️ Add text (required)",
     "status.media_done": "✅ Media added · {n}/10",
