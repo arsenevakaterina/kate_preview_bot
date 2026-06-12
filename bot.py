@@ -70,6 +70,9 @@ S = {
     "hint.need_text": "Add text — it will become the caption.",
     "hint.need_media": "Now send a photo or video.",
     "hint.ready": "Ready to upload.",
+    "did.text_added": "✅ Text added",
+    "did.text_replaced": "✅ Text replaced",
+    "did.media_added": "✅ Media added",
     "btn.confirm": "✅ Confirm and upload",
     "btn.preview": "👁 Show preview",
     "btn.restart": "↻ Start over",
@@ -185,6 +188,9 @@ async def refresh_panel(bot: Bot, chat_id: int, d: dict, header: Optional[str] =
     every incoming message we send a NEW panel (a clear reply with buttons) and
     delete the previous one, keeping exactly ONE interactive panel alive.
     """
+    # A shown preview no longer matches the draft the moment the user adds
+    # anything, so drop it right away instead of waiting for the next preview.
+    await delete_preview(bot, chat_id, d)
     old_panel_id = d["panel_msg_id"]
     await send_panel(bot, chat_id, d, header)
     if old_panel_id is not None and old_panel_id != d["panel_msg_id"]:
@@ -268,13 +274,15 @@ async def flush_album(bot: Bot, chat_id: int, user_id: int) -> None:
     d["album_buffer"] = None
 
     overflowed = False
+    added = 0
     for item in items:
         if len(d["media"]) >= MAX_MEDIA:
             overflowed = True
             break
         d["media"].append(item)
+        added += 1
 
-    await refresh_panel(bot, chat_id, d)
+    await refresh_panel(bot, chat_id, d, header=S["did.media_added"] if added else None)
     if overflowed:
         # Best-effort notice; album messages have no callback to answer, so send text.
         try:
@@ -324,7 +332,7 @@ async def on_single_media(message: Message, bot: Bot) -> None:
         return
 
     d["media"].append(item)
-    await refresh_panel(bot, message.chat.id, d)
+    await refresh_panel(bot, message.chat.id, d, header=S["did.media_added"])
 
 
 @dp.message(F.text)
@@ -338,8 +346,12 @@ async def on_text(message: Message, bot: Bot) -> None:
         await message.answer(S["err.too_long"])
         return
 
+    replaced = d["text"] is not None
     d["text"] = text
-    await refresh_panel(bot, message.chat.id, d)
+    await refresh_panel(
+        bot, message.chat.id, d,
+        header=S["did.text_replaced"] if replaced else S["did.text_added"],
+    )
 
 
 @dp.message()
