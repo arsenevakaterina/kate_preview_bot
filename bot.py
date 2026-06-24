@@ -340,17 +340,19 @@ async def show_link_gate(bot: Bot, chat_id: int, d: dict) -> None:
 # even though the feature is colloquially "price-predict".
 # ---------------------------------------------------------------------------
 
-# Our "database" of known channels. One seeded test channel: pasting a link to
-# it takes the IN-DB branch (we already know its category/country, so we only
-# ask for the placement format + the user's role). Any other real channel takes
-# the NOT-IN-DB branch (we ask category + country + format + role).
+# Channels we already have first-hand data for. Seeded with one demo channel so
+# there's always a link that returns rich data even when Telegram can't be
+# reached. The user never learns whether a channel is "known" to us or not — the
+# bot is meant to look like it knows every channel.
 KNOWN_CHANNELS: dict[str, dict] = {
     "adstail_demo": {
         "title": "Adstail Demo Channel",
         "username": "adstail_demo",
         "category": "Crypto & Web3",
-        "country": "International",
+        "region": "Worldwide",
+        "geo": "Worldwide",
         "subscribers": 48_000,
+        "bio": "Daily Web3 alpha, on-chain signals and market recaps. Ads: @adstail",
         "cpm_usd": 4.5,
     },
 }
@@ -359,9 +361,23 @@ PP_CATEGORIES = [
     "News & Politics", "Crypto & Web3", "Tech & IT", "Business & Finance",
     "Entertainment", "Lifestyle", "Education", "Other",
 ]
-PP_COUNTRIES = [
-    "Russia", "USA", "UK", "Germany", "India", "Brazil", "UAE", "International",
+
+# Geo is asked in two light taps: region first, then (optionally) a country
+# inside it. Picking a whole region is a valid answer on its own — that's what
+# replaces a flat "International": you can leave it as e.g. "Asia".
+PP_REGIONS = [
+    "Europe", "CIS", "North America", "Latin America",
+    "Asia", "Middle East", "Africa", "Worldwide",
 ]
+PP_COUNTRIES_BY_REGION = {
+    "Europe": ["UK", "Germany", "France", "Italy", "Spain", "Poland", "Netherlands"],
+    "CIS": ["Russia", "Ukraine", "Kazakhstan", "Belarus", "Uzbekistan"],
+    "North America": ["USA", "Canada", "Mexico"],
+    "Latin America": ["Brazil", "Argentina", "Colombia", "Chile"],
+    "Asia": ["India", "Indonesia", "China", "Japan", "Vietnam", "Philippines"],
+    "Middle East": ["UAE", "Saudi Arabia", "Israel", "Turkey"],
+    "Africa": ["Nigeria", "Egypt", "South Africa", "Kenya"],
+}
 PP_FORMATS = ["1/24h", "1/48h", "1/7d", "1/30d"]
 
 # Toy price model (the real backend doesn't exist yet).
@@ -371,16 +387,28 @@ _CATEGORY_MULT = {
     "Business & Finance": 1.6, "Entertainment": 0.9, "Lifestyle": 1.0,
     "Education": 1.1, "Other": 1.0,
 }
-_COUNTRY_MULT = {
-    "Russia": 0.8, "USA": 1.8, "UK": 1.5, "Germany": 1.4, "India": 0.6,
-    "Brazil": 0.7, "UAE": 1.6, "International": 1.0,
+# Geo multiplier: a specific country overrides its region; a region-wide answer
+# falls back to the region rate.
+_REGION_MULT = {
+    "Europe": 1.4, "CIS": 0.8, "North America": 1.8, "Latin America": 0.8,
+    "Asia": 0.9, "Middle East": 1.5, "Africa": 0.6, "Worldwide": 1.1,
 }
+_COUNTRY_MULT = {
+    "USA": 1.9, "UK": 1.6, "Germany": 1.5, "France": 1.4, "UAE": 1.7,
+    "Israel": 1.5, "Russia": 0.85, "India": 0.6, "Brazil": 0.75, "China": 1.0,
+    "Japan": 1.5,
+}
+
+
+def _geo_mult(geo: str) -> float:
+    return _COUNTRY_MULT.get(geo) or _REGION_MULT.get(geo) or 1.0
+
 
 PPS = {
     "intro": (
-        "🔮 Price Predict\n\n"
-        "I find or predict the ad-placement price for any public Telegram channel.\n"
-        "Paste a channel link and I'll estimate what a post there costs."
+        "💸 Ever wondered what an ad in a Telegram channel actually costs?\n\n"
+        "Drop me a channel link — I'll size up its audience and tell you what a "
+        "post there is worth."
     ),
     "ask_link": "🔗 Send a link to the channel (e.g. https://t.me/durov or @durov).",
     "bad_link": (
@@ -410,15 +438,17 @@ predict_sessions: dict[int, dict] = {}
 
 def new_predict_session() -> dict:
     return {
-        "step": "await_link",   # await_link | await_category | await_country
-                                # | await_format | await_role | done
+        "step": "await_link",   # await_link | await_category | await_region
+                                # | await_country | await_format | await_role | done
         "url": None,
         "username": None,
         "channel_title": None,
-        "in_db": False,
-        "db_record": None,
+        "bio": None,
+        "subscribers": None,
+        "db_record": None,      # internal only — never surfaced to the user
         "category": None,
-        "country": None,
+        "region": None,
+        "geo": None,            # the chosen geo label (a country or a region)
         "fmt": None,
         "role": None,           # owner | advertiser
         "panel_msg_id": None,
@@ -459,36 +489,40 @@ def parse_tg_username(text: Optional[str]) -> Optional[str]:
     return None
 
 
-async def pp_check_tg(bot: Bot, username: str) -> tuple[bool, Optional[str]]:
-    """Best-effort 'does this channel exist on Telegram?' check via get_chat.
+async def pp_fetch_channel(bot: Bot, username: str) -> Optional[dict]:
+    """Pull public channel data from Telegram: title, bio/description, subscriber
+    count. Returns None if Telegram can't resolve the channel at all.
 
-    Public channels/users resolve by @username. If Telegram can't resolve it we
-    treat it as non-existent. (Channels we already know from KNOWN_CHANNELS skip
-    this and are always considered to exist.)
+    All of this is public for open channels. Some fields can still be missing
+    (e.g. member count is hidden) — callers handle None per field.
     """
     try:
         chat = await bot.get_chat(f"@{username}")
-        title = chat.title or chat.full_name or f"@{username}"
-        return True, title
     except Exception:  # noqa: BLE001 — network/notfound/forbidden all mean "no"
-        return False, None
+        return None
+    title = chat.title or chat.full_name or f"@{username}"
+    bio = getattr(chat, "description", None) or getattr(chat, "bio", None)
+    try:
+        subs = await bot.get_chat_member_count(chat.id)
+    except Exception:  # noqa: BLE001 — count is often hidden; not fatal
+        subs = None
+    return {"title": title, "bio": bio, "subscribers": subs}
 
 
-def predict_price(category: str, country: str, fmt: str, rec: Optional[dict]):
-    """Toy price estimator. Returns (low, high, subscribers|None) in USD."""
+def predict_price(category: str, geo: str, fmt: str,
+                  subscribers: Optional[int], cpm: Optional[float] = None):
+    """Toy price estimator. Returns (low, high) in USD."""
     fmt_mult = _FORMAT_MULT.get(fmt, 1.0)
     cat_mult = _CATEGORY_MULT.get(category, 1.0)
-    country_mult = _COUNTRY_MULT.get(country, 1.0)
-    if rec:
-        subs = rec["subscribers"]
-        base = subs / 1000 * rec["cpm_usd"]   # CPM-style base for a 1/24h post
+    geo_mult = _geo_mult(geo)
+    if subscribers:
+        base = subscribers / 1000 * (cpm or 3.0)   # CPM-style base for a 1/24h post
     else:
-        subs = None
-        base = 60.0                            # baseline for an unknown channel
-    price = base * fmt_mult * cat_mult * country_mult
+        base = 60.0                                  # baseline if size is hidden
+    price = base * fmt_mult * cat_mult * geo_mult
     low = int(round(price * 0.80 / 5) * 5)
     high = int(round(price * 1.25 / 5) * 5)
-    return low, high, subs
+    return low, high
 
 
 # --- panel rendering ------------------------------------------------------
@@ -505,44 +539,72 @@ def _pp_grid_kb(items: list[str], prefix: str, per_row: int = 2) -> InlineKeyboa
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def pp_country_kb(region: str) -> InlineKeyboardMarkup:
+    """Countries inside a region, plus a 'whole region' shortcut."""
+    countries = PP_COUNTRIES_BY_REGION.get(region, [])
+    rows, row = [], []
+    for i, c in enumerate(countries):
+        row.append(InlineKeyboardButton(text=c, callback_data=f"pp:country:{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text=f"🌐 All of {region}", callback_data="pp:country:all")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def pp_role_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👑 I own this channel", callback_data="pp:role:owner")],
-        [InlineKeyboardButton(text="📣 I want to advertise", callback_data="pp:role:adv")],
+        [InlineKeyboardButton(text="👑 I run this channel", callback_data="pp:role:owner")],
+        [InlineKeyboardButton(text="📣 I'm looking to advertise", callback_data="pp:role:adv")],
     ])
 
 
+def _clip(text: str, limit: int = 140) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def pp_header(s: dict) -> str:
+    """Channel snapshot shown above every question — public title/bio/audience.
+
+    Deliberately says nothing about whether we 'know' the channel; the bot
+    presents the same confident snapshot for every channel.
+    """
     lines = [f"📡 {s['channel_title']}  (@{s['username']})"]
-    lines.append(
-        "✅ Found in the Adstail database" if s["in_db"]
-        else "🆕 New channel — not in our database yet"
-    )
+    if s.get("subscribers"):
+        lines.append(f"👥 {s['subscribers']:,} subscribers")
+    if s.get("bio"):
+        lines.append(f"ℹ️ {_clip(s['bio'])}")
     facts = []
     if s.get("category"):
         facts.append(f"🏷 {s['category']}")
-    if s.get("country"):
-        facts.append(f"🌍 {s['country']}")
+    if s.get("geo"):
+        facts.append(f"🌍 {s['geo']}")
     if facts:
         lines.append(" · ".join(facts))
     return "\n".join(lines)
 
 
 def pp_category_q(s: dict) -> str:
-    return pp_header(s) + "\n\nStep 1 of 3 — pick the channel category:"
+    return pp_header(s) + "\n\nWhat's this channel about? Pick a category:"
+
+
+def pp_region_q(s: dict) -> str:
+    return pp_header(s) + "\n\nWhere's the audience? Pick a region:"
 
 
 def pp_country_q(s: dict) -> str:
-    return pp_header(s) + "\n\nStep 2 of 3 — pick the main audience country (or International):"
+    return pp_header(s) + "\n\nNarrow it down to a country — or keep the whole region:"
 
 
 def pp_format_q(s: dict) -> str:
-    label = "Pick the placement format:" if s["in_db"] else "Step 3 of 3 — pick the placement format:"
-    return pp_header(s) + "\n\n" + label
+    return pp_header(s) + "\n\nHow long should the post stay up? Pick a placement format:"
 
 
 def pp_role_q(s: dict) -> str:
-    return pp_header(s) + "\n\nLast one — why are you checking this price?"
+    return pp_header(s) + "\n\nLast one — what brings you here?"
 
 
 async def pp_send_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: InlineKeyboardMarkup) -> None:
@@ -572,46 +634,54 @@ async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> Non
 
     rec = KNOWN_CHANNELS.get(username)
     if rec:
-        in_tg, title = True, rec["title"]   # known to us ⇒ treat as existing
+        # We already hold data for this one (and it may not be live on Telegram).
+        info = {"title": rec["title"], "bio": rec.get("bio"), "subscribers": rec["subscribers"]}
     else:
-        in_tg, title = await pp_check_tg(bot, username)
-    if not in_tg:
+        info = await pp_fetch_channel(bot, username)
+    if info is None:
         await bot.send_message(chat_id, PPS["not_in_tg"].format(u=username))
         return
 
     s["username"] = username
     s["url"] = text.strip()
-    s["channel_title"] = title or f"@{username}"
+    s["channel_title"] = info["title"] or f"@{username}"
+    s["bio"] = info.get("bio")
+    s["subscribers"] = info.get("subscribers")
 
     if rec:
-        # In our DB: category/country already known → ask format, then role.
-        s["in_db"] = True
+        # Category/geo already on hand → just ask format, then role.
         s["db_record"] = rec
         s["category"] = rec["category"]
-        s["country"] = rec["country"]
+        s["region"] = rec.get("region")
+        s["geo"] = rec["geo"]
         s["step"] = "await_format"
         await pp_send_panel(bot, chat_id, s, pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:"))
     else:
-        # New channel: ask the full set of questions.
-        s["in_db"] = False
+        # Otherwise ask the full set: category → region → (country) → format → role.
         s["step"] = "await_category"
         await pp_send_panel(bot, chat_id, s, pp_category_q(s), _pp_grid_kb(PP_CATEGORIES, "pp:cat:"))
 
 
 async def pp_show_result(bot: Bot, chat_id: int, s: dict) -> None:
     """Pretend to call the (non-existent) pricing backend and render the result."""
-    low, high, subs = predict_price(s["category"], s["country"], s["fmt"], s.get("db_record"))
+    rec = s.get("db_record")
+    cpm = rec["cpm_usd"] if rec else None
+    low, high = predict_price(s["category"], s["geo"], s["fmt"], s.get("subscribers"), cpm)
     lines = [
-        "🔮 Price prediction",
+        "💸 Here's what an ad here is worth",
         "",
         f"📡 Channel: {s['channel_title']} (@{s['username']})",
-        f"🏷 Category: {s['category']}",
-        f"🌍 Country: {s['country']}",
-        f"🗓 Format: {s['fmt']}",
     ]
-    if subs:
-        lines.append(f"👥 Audience: {subs:,} subscribers")
-    lines += ["", f"💰 Estimated price: ${low:,}–${high:,} per post", ""]
+    if s.get("subscribers"):
+        lines.append(f"👥 Audience: {s['subscribers']:,} subscribers")
+    lines += [
+        f"🏷 Category: {s['category']}",
+        f"🌍 Geo: {s['geo']}",
+        f"🗓 Format: {s['fmt']}",
+        "",
+        f"💰 Estimated price: ${low:,}–${high:,} per post",
+        "",
+    ]
     lines.append(PPS["cta_owner" if s["role"] == "owner" else "cta_adv"].format(title=s["channel_title"]))
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -802,8 +872,32 @@ async def pp_cb_category(cq: CallbackQuery, bot: Bot) -> None:
     if not 0 <= idx < len(PP_CATEGORIES):
         return
     s["category"] = PP_CATEGORIES[idx]
-    s["step"] = "await_country"
-    await pp_edit_panel(bot, cq.message.chat.id, s, pp_country_q(s), _pp_grid_kb(PP_COUNTRIES, "pp:country:"))
+    s["step"] = "await_region"
+    await pp_edit_panel(bot, cq.message.chat.id, s, pp_region_q(s), _pp_grid_kb(PP_REGIONS, "pp:region:"))
+
+
+@dp.callback_query(F.data.startswith("pp:region:"))
+async def pp_cb_region(cq: CallbackQuery, bot: Bot) -> None:
+    s = predict_sessions.get(cq.from_user.id)
+    await cq.answer()
+    if not s or s["step"] != "await_region":
+        return
+    try:
+        idx = int(cq.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    if not 0 <= idx < len(PP_REGIONS):
+        return
+    region = PP_REGIONS[idx]
+    s["region"] = region
+    if not PP_COUNTRIES_BY_REGION.get(region):
+        # Region with no country breakdown (e.g. Worldwide) is a complete answer.
+        s["geo"] = region
+        s["step"] = "await_format"
+        await pp_edit_panel(bot, cq.message.chat.id, s, pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:"))
+    else:
+        s["step"] = "await_country"
+        await pp_edit_panel(bot, cq.message.chat.id, s, pp_country_q(s), pp_country_kb(region))
 
 
 @dp.callback_query(F.data.startswith("pp:country:"))
@@ -812,13 +906,19 @@ async def pp_cb_country(cq: CallbackQuery, bot: Bot) -> None:
     await cq.answer()
     if not s or s["step"] != "await_country":
         return
-    try:
-        idx = int(cq.data.split(":")[2])
-    except (ValueError, IndexError):
-        return
-    if not 0 <= idx < len(PP_COUNTRIES):
-        return
-    s["country"] = PP_COUNTRIES[idx]
+    choice = cq.data.split(":")[2]
+    region = s.get("region")
+    countries = PP_COUNTRIES_BY_REGION.get(region, [])
+    if choice == "all":
+        s["geo"] = region            # keep it region-wide (e.g. "Asia")
+    else:
+        try:
+            idx = int(choice)
+        except ValueError:
+            return
+        if not 0 <= idx < len(countries):
+            return
+        s["geo"] = countries[idx]
     s["step"] = "await_format"
     await pp_edit_panel(bot, cq.message.chat.id, s, pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:"))
 
