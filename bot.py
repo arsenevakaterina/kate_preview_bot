@@ -410,18 +410,17 @@ PPS = {
         "Drop me a channel link — I'll size up its audience and tell you what a "
         "post there is worth."
     ),
-    "ask_link": "🔗 Send a link to the channel (e.g. https://t.me/durov or @durov).",
+    "ask_link": "🔗 Send a link to the channel (e.g. <code>https://t.me/durov</code> or <code>@durov</code>).",
     "bad_link": (
         "🚫 That doesn't look like a Telegram channel link.\n"
-        "Send something like https://t.me/durov or @durov."
+        "Send something like <code>https://t.me/durov</code> or <code>@durov</code>."
     ),
     "not_in_tg": (
-        "🔍 I couldn't find @{u} on Telegram.\n"
+        "🔍 I couldn't find <code>@{u}</code> on Telegram.\n"
         "Double-check the link and try again."
     ),
-    "send_link_hint": "Please paste a channel link first (e.g. https://t.me/durov).",
+    "send_link_hint": "Please paste a channel link first (e.g. <code>https://t.me/durov</code>).",
     "use_buttons": "Please use the buttons above to answer 🙂",
-    "closed": "👋 Closed. Send /price_predict whenever you want another estimate.",
     "cta_owner": (
         "👑 This is your channel?\n"
         "Connect {title} on adstail.com to manage placements and earn from your "
@@ -619,28 +618,31 @@ def pp_role_q(s: dict) -> str:
     return pp_header(s) + "\n\nLast one — what brings you here?"
 
 
-async def pp_send_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: InlineKeyboardMarkup) -> None:
-    msg = await bot.send_message(chat_id, text, reply_markup=kb)
+async def pp_send_panel(bot: Bot, chat_id: int, s: dict, text: str,
+                        kb: Optional[InlineKeyboardMarkup], parse_mode: Optional[str] = None) -> None:
+    msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=parse_mode)
     s["panel_msg_id"] = msg.message_id
 
 
-async def pp_edit_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: Optional[InlineKeyboardMarkup]) -> None:
+async def pp_edit_panel(bot: Bot, chat_id: int, s: dict, text: str,
+                        kb: Optional[InlineKeyboardMarkup], parse_mode: Optional[str] = None) -> None:
     if s.get("panel_msg_id") is None:
-        await pp_send_panel(bot, chat_id, s, text, kb)
+        await pp_send_panel(bot, chat_id, s, text, kb, parse_mode)
         return
     try:
         await bot.edit_message_text(
-            text=text, chat_id=chat_id, message_id=s["panel_msg_id"], reply_markup=kb
+            text=text, chat_id=chat_id, message_id=s["panel_msg_id"],
+            reply_markup=kb, parse_mode=parse_mode,
         )
     except TelegramBadRequest:
         pass
 
 
 # --- step rendering & navigation -----------------------------------------
-# Every step renders onto the SAME panel. The first step (await_link) carries a
-# full Exit; every later step carries a Back to the previous step.
+# Every step renders onto the SAME panel. The first step (await_link) is just a
+# prompt; every later step carries a Back to the previous step.
 
-def pp_step_view(s: dict) -> tuple[str, InlineKeyboardMarkup]:
+def pp_step_view(s: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     """(text, keyboard) for the session's current step."""
     step = s["step"]
     if step == "await_category":
@@ -653,11 +655,14 @@ def pp_step_view(s: dict) -> tuple[str, InlineKeyboardMarkup]:
         return pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:", back=True)
     if step == "await_role":
         return pp_role_q(s), pp_role_kb(back=True)
-    # await_link (and any fallback): just the prompt + a full Exit.
-    exit_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✖️ Exit", callback_data="pp:exit")],
-    ])
-    return PPS["ask_link"], exit_kb
+    # await_link (and any fallback): just the prompt, no buttons.
+    return PPS["ask_link"], None
+
+
+def _pp_step_parse_mode(s: dict) -> Optional[str]:
+    # Only the link prompt uses HTML (for the copyable <code> examples); the
+    # question panels stay plain so a channel bio can't break entity parsing.
+    return "HTML" if s["step"] == "await_link" else None
 
 
 def pp_prev_step(s: dict) -> str:
@@ -683,12 +688,12 @@ def pp_prev_step(s: dict) -> str:
 
 async def pp_send_step(bot: Bot, chat_id: int, s: dict) -> None:
     text, kb = pp_step_view(s)
-    await pp_send_panel(bot, chat_id, s, text, kb)
+    await pp_send_panel(bot, chat_id, s, text, kb, _pp_step_parse_mode(s))
 
 
 async def pp_edit_step(bot: Bot, chat_id: int, s: dict) -> None:
     text, kb = pp_step_view(s)
-    await pp_edit_panel(bot, chat_id, s, text, kb)
+    await pp_edit_panel(bot, chat_id, s, text, kb, _pp_step_parse_mode(s))
 
 
 async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> None:
@@ -696,7 +701,7 @@ async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> Non
     s = predict_sessions[user_id]
     username = parse_tg_username(text)
     if not username:
-        await bot.send_message(chat_id, PPS["bad_link"])
+        await bot.send_message(chat_id, PPS["bad_link"], parse_mode="HTML")
         return
 
     rec = KNOWN_CHANNELS.get(username)
@@ -706,7 +711,7 @@ async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> Non
     else:
         info = await pp_fetch_channel(bot, username)
     if info is None:
-        await bot.send_message(chat_id, PPS["not_in_tg"].format(u=username))
+        await bot.send_message(chat_id, PPS["not_in_tg"].format(u=username), parse_mode="HTML")
         return
 
     s["username"] = username
@@ -870,7 +875,10 @@ async def on_album_item(message: Message, bot: Bot) -> None:
 async def on_single_media(message: Message, bot: Bot) -> None:
     if _pp_active(message.from_user.id):
         s = predict_sessions[message.from_user.id]
-        await message.answer(PPS["send_link_hint"] if s["step"] == "await_link" else PPS["use_buttons"])
+        await message.answer(
+            PPS["send_link_hint"] if s["step"] == "await_link" else PPS["use_buttons"],
+            parse_mode="HTML",
+        )
         return
     d = get_draft(message.from_user.id)
     if d["stage"] != "composing":
@@ -1043,22 +1051,6 @@ async def pp_cb_back(cq: CallbackQuery, bot: Bot) -> None:
     await pp_edit_step(bot, cq.message.chat.id, s)
 
 
-@dp.callback_query(F.data == "pp:exit")
-async def pp_cb_exit(cq: CallbackQuery, bot: Bot) -> None:
-    s = predict_sessions.get(cq.from_user.id)
-    await cq.answer()
-    predict_sessions.pop(cq.from_user.id, None)
-    chat_id = cq.message.chat.id
-    panel_id = s.get("panel_msg_id") if s else None
-    if panel_id is not None:
-        try:
-            await bot.edit_message_text(text=PPS["closed"], chat_id=chat_id, message_id=panel_id, reply_markup=None)
-            return
-        except TelegramBadRequest:
-            pass
-    await bot.send_message(chat_id, PPS["closed"])
-
-
 @dp.callback_query(F.data == "pp:restart")
 async def pp_cb_restart(cq: CallbackQuery, bot: Bot) -> None:
     await cq.answer()
@@ -1085,7 +1077,10 @@ async def on_text(message: Message, bot: Bot) -> None:
 async def on_unsupported(message: Message, bot: Bot) -> None:
     if _pp_active(message.from_user.id):
         s = predict_sessions[message.from_user.id]
-        await message.answer(PPS["send_link_hint"] if s["step"] == "await_link" else PPS["use_buttons"])
+        await message.answer(
+            PPS["send_link_hint"] if s["step"] == "await_link" else PPS["use_buttons"],
+            parse_mode="HTML",
+        )
         return
     d = get_draft(message.from_user.id)
     if d["stage"] != "composing":
