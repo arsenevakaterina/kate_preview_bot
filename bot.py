@@ -730,7 +730,9 @@ async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> Non
     else:
         # Otherwise ask the full set: category → region → (country) → format → role.
         s["step"] = "await_category"
-    await pp_edit_step(bot, chat_id, s)
+    # Reply to the pasted link with a FRESH panel below it — never overwrite the
+    # "send a link" example message. Button steps from here edit this panel.
+    await pp_send_step(bot, chat_id, s)
 
 
 async def pp_show_result(bot: Bot, chat_id: int, s: dict) -> None:
