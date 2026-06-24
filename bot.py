@@ -362,21 +362,26 @@ PP_CATEGORIES = [
     "Entertainment", "Lifestyle", "Education", "Other",
 ]
 
-# Geo is asked in two light taps: region first, then (optionally) a country
-# inside it. Picking a whole region is a valid answer on its own — that's what
-# replaces a flat "International": you can leave it as e.g. "Asia".
+# Geo is asked in two light taps: region first, then a country inside it. The
+# regions cover the WHOLE world, so every channel fits somewhere. Inside a region
+# the user can pick a top market, "All of {region}" (region-wide), or "Other
+# country" — the catch-all for smaller markets, priced at the region rate. That
+# keeps any country reachable without listing all ~200 of them.
 PP_REGIONS = [
-    "Europe", "CIS", "North America", "Latin America",
-    "Asia", "Middle East", "Africa", "Worldwide",
+    "Europe", "CIS", "North America", "Latin America", "MENA",
+    "Africa", "South Asia", "Asia-Pacific", "Worldwide",
 ]
 PP_COUNTRIES_BY_REGION = {
-    "Europe": ["UK", "Germany", "France", "Italy", "Spain", "Poland", "Netherlands"],
-    "CIS": ["Russia", "Ukraine", "Kazakhstan", "Belarus", "Uzbekistan"],
-    "North America": ["USA", "Canada", "Mexico"],
-    "Latin America": ["Brazil", "Argentina", "Colombia", "Chile"],
-    "Asia": ["India", "Indonesia", "China", "Japan", "Vietnam", "Philippines"],
-    "Middle East": ["UAE", "Saudi Arabia", "Israel", "Turkey"],
-    "Africa": ["Nigeria", "Egypt", "South Africa", "Kenya"],
+    "Europe": ["UK", "Germany", "France", "Italy", "Spain", "Poland", "Netherlands", "Sweden"],
+    "CIS": ["Russia", "Ukraine", "Kazakhstan", "Belarus", "Uzbekistan", "Azerbaijan", "Georgia"],
+    "North America": ["USA", "Canada"],
+    "Latin America": ["Brazil", "Mexico", "Argentina", "Colombia", "Chile", "Peru"],
+    "MENA": ["UAE", "Saudi Arabia", "Egypt", "Israel", "Turkey", "Qatar", "Morocco"],
+    "Africa": ["Nigeria", "South Africa", "Kenya", "Ghana", "Ethiopia", "Tanzania"],
+    "South Asia": ["India", "Pakistan", "Bangladesh", "Sri Lanka"],
+    "Asia-Pacific": ["China", "Japan", "Indonesia", "Vietnam", "Philippines",
+                     "Thailand", "South Korea", "Australia"],
+    # "Worldwide" has no country breakdown — it's the region-wide answer itself.
 }
 PP_FORMATS = ["1/24h", "1/48h", "1/7d", "1/30d"]
 
@@ -387,21 +392,25 @@ _CATEGORY_MULT = {
     "Business & Finance": 1.6, "Entertainment": 0.9, "Lifestyle": 1.0,
     "Education": 1.1, "Other": 1.0,
 }
-# Geo multiplier: a specific country overrides its region; a region-wide answer
-# falls back to the region rate.
+# Geo multiplier: a specific known country overrides its region; "All of region"
+# and "Other country" both fall back to the region rate.
 _REGION_MULT = {
-    "Europe": 1.4, "CIS": 0.8, "North America": 1.8, "Latin America": 0.8,
-    "Asia": 0.9, "Middle East": 1.5, "Africa": 0.6, "Worldwide": 1.1,
+    "Europe": 1.4, "CIS": 0.8, "North America": 1.9, "Latin America": 0.8,
+    "MENA": 1.4, "Africa": 0.6, "South Asia": 0.6, "Asia-Pacific": 1.0,
+    "Worldwide": 1.1,
 }
 _COUNTRY_MULT = {
-    "USA": 1.9, "UK": 1.6, "Germany": 1.5, "France": 1.4, "UAE": 1.7,
-    "Israel": 1.5, "Russia": 0.85, "India": 0.6, "Brazil": 0.75, "China": 1.0,
-    "Japan": 1.5,
+    "USA": 1.9, "UK": 1.6, "Germany": 1.5, "France": 1.4, "Sweden": 1.5,
+    "UAE": 1.7, "Saudi Arabia": 1.5, "Qatar": 1.7, "Israel": 1.5,
+    "Japan": 1.6, "South Korea": 1.5, "Australia": 1.7, "China": 1.0,
+    "Russia": 0.85, "India": 0.6, "Brazil": 0.75, "Mexico": 0.8,
 }
 
 
-def _geo_mult(geo: str) -> float:
-    return _COUNTRY_MULT.get(geo) or _REGION_MULT.get(geo) or 1.0
+def _geo_mult(geo: str, region: Optional[str] = None) -> float:
+    # Known country rate first; otherwise the region rate (covers "All of
+    # {region}" and "Other country"); otherwise neutral.
+    return _COUNTRY_MULT.get(geo) or _REGION_MULT.get(region) or _REGION_MULT.get(geo) or 1.0
 
 
 PPS = {
@@ -525,12 +534,12 @@ async def pp_fetch_channel(bot: Bot, username: str) -> Optional[dict]:
     return {"title": title, "bio": bio, "subscribers": subs}
 
 
-def predict_price(category: str, geo: str, fmt: str,
+def predict_price(category: str, geo: str, region: Optional[str], fmt: str,
                   subscribers: Optional[int], cpm: Optional[float] = None):
     """Toy price estimator. Returns (low, high) in USD."""
     fmt_mult = _FORMAT_MULT.get(fmt, 1.0)
     cat_mult = _CATEGORY_MULT.get(category, 1.0)
-    geo_mult = _geo_mult(geo)
+    geo_mult = _geo_mult(geo, region)
     if subscribers:
         base = subscribers / 1000 * (cpm or 3.0)   # CPM-style base for a 1/24h post
     else:
@@ -573,6 +582,7 @@ def pp_country_kb(region: str, back: bool = False) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton(text=f"🌐 All of {region}", callback_data="pp:country:all")])
+    rows.append([InlineKeyboardButton(text="➕ Other country", callback_data="pp:country:other")])
     if back:
         rows.append(_pp_back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -623,7 +633,8 @@ def pp_region_q(s: dict) -> str:
 
 
 def pp_country_q(s: dict) -> str:
-    return pp_header(s) + "\n\nNarrow it down to a country — or keep the whole region:"
+    return pp_header(s) + ("\n\nPick the country — or keep the whole region. "
+                           "Smaller markets go under “Other country”:")
 
 
 def pp_format_q(s: dict) -> str:
@@ -763,7 +774,7 @@ async def pp_show_result(bot: Bot, chat_id: int, s: dict) -> None:
     """Pretend to call the (non-existent) pricing backend and render the result."""
     rec = s.get("db_record")
     cpm = rec["cpm_usd"] if rec else None
-    low, high = predict_price(s["category"], s["geo"], s["fmt"], s.get("subscribers"), cpm)
+    low, high = predict_price(s["category"], s["geo"], s.get("region"), s["fmt"], s.get("subscribers"), cpm)
     lines = [
         "💸 Here's what an ad here is worth",
         "",
@@ -1004,7 +1015,9 @@ async def pp_cb_country(cq: CallbackQuery, bot: Bot) -> None:
     region = s.get("region")
     countries = PP_COUNTRIES_BY_REGION.get(region, [])
     if choice == "all":
-        s["geo"] = region            # keep it region-wide (e.g. "Asia")
+        s["geo"] = region            # keep it region-wide (e.g. "Asia-Pacific")
+    elif choice == "other":
+        s["geo"] = f"Other ({region})"   # a smaller market — priced at region rate
     else:
         try:
             idx = int(choice)
