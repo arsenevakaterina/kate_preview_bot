@@ -432,14 +432,22 @@ PPS = {
     ),
 }
 
-# user_id -> price-predict session dict
-predict_sessions: dict[int, dict] = {}
+# Each PANEL is its own independent flow, so two pasted links don't share state.
+# panel_msg_id -> session dict. A callback finds its session by the message its
+# button is attached to, so tapping an older panel records onto THAT channel.
+pp_sessions: dict[int, dict] = {}
+
+# Users currently in the price-predict flow (entered via /price_predict). While a
+# user is here, their free text is treated as channel links and the creative
+# handlers stand aside. Cleared when they switch to /creative.
+pp_mode_users: set[int] = set()
 
 
-def new_predict_session() -> dict:
+def new_predict_session(user_id: int) -> dict:
     return {
-        "step": "await_link",   # await_link | await_category | await_region
-                                # | await_country | await_format | await_role | done
+        "user_id": user_id,
+        "step": "await_category",   # await_category | await_region | await_country
+                                    # | await_format | await_role | done
         "url": None,
         "username": None,
         "channel_title": None,
@@ -456,9 +464,17 @@ def new_predict_session() -> dict:
 
 
 def _pp_active(user_id: int) -> bool:
-    """True while the user is mid-flow (so the creative handlers stand aside)."""
-    s = predict_sessions.get(user_id)
-    return bool(s) and s.get("step") not in (None, "done")
+    """True while the user is in the price-predict flow (creative handlers defer)."""
+    return user_id in pp_mode_users
+
+
+def pp_session_for(cq: CallbackQuery) -> Optional[dict]:
+    """The session a callback belongs to — keyed by the panel the button is on,
+    so each panel acts on its own channel even when several are in the chat."""
+    s = pp_sessions.get(cq.message.message_id)
+    if s is None or s["user_id"] != cq.from_user.id:
+        return None
+    return s
 
 
 # --- link parsing & validation -------------------------------------------
@@ -639,66 +655,73 @@ async def pp_edit_panel(bot: Bot, chat_id: int, s: dict, text: str,
 
 
 # --- step rendering & navigation -----------------------------------------
-# Every step renders onto the SAME panel. The first step (await_link) is just a
-# prompt; every later step carries a Back to the previous step.
+# Each panel renders one channel's flow. A step carries Back only when there's a
+# previous QUESTION to return to within this same panel (you switch channels by
+# pasting a new link, which opens a separate panel — never by going "back").
+
+def _pp_has_back(s: dict) -> bool:
+    step = s["step"]
+    if step in ("await_region", "await_country", "await_role"):
+        return True
+    if step == "await_format":
+        return not s.get("db_record")   # known channel: format is the first step
+    return False                        # await_category (and anything else)
+
 
 def pp_step_view(s: dict) -> tuple[str, Optional[InlineKeyboardMarkup]]:
     """(text, keyboard) for the session's current step."""
     step = s["step"]
+    back = _pp_has_back(s)
     if step == "await_category":
-        return pp_category_q(s), _pp_grid_kb(PP_CATEGORIES, "pp:cat:", back=True)
+        return pp_category_q(s), _pp_grid_kb(PP_CATEGORIES, "pp:cat:", back=back)
     if step == "await_region":
-        return pp_region_q(s), _pp_grid_kb(PP_REGIONS, "pp:region:", back=True)
+        return pp_region_q(s), _pp_grid_kb(PP_REGIONS, "pp:region:", back=back)
     if step == "await_country":
-        return pp_country_q(s), pp_country_kb(s.get("region"), back=True)
+        return pp_country_q(s), pp_country_kb(s.get("region"), back=back)
     if step == "await_format":
-        return pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:", back=True)
+        return pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:", back=back)
     if step == "await_role":
-        return pp_role_q(s), pp_role_kb(back=True)
-    # await_link (and any fallback): just the prompt, no buttons.
-    return PPS["ask_link"], None
+        return pp_role_q(s), pp_role_kb(back=back)
+    return pp_category_q(s), _pp_grid_kb(PP_CATEGORIES, "pp:cat:")
 
 
-def _pp_step_parse_mode(s: dict) -> Optional[str]:
-    # Only the link prompt uses HTML (for the copyable <code> examples); the
-    # question panels stay plain so a channel bio can't break entity parsing.
-    return "HTML" if s["step"] == "await_link" else None
-
-
-def pp_prev_step(s: dict) -> str:
-    """Where Back goes from the current step."""
+def pp_prev_step(s: dict) -> Optional[str]:
+    """Where Back goes from the current step (None if there's no previous step)."""
     step = s["step"]
-    if step == "await_category":
-        return "await_link"
     if step == "await_region":
         return "await_category"
     if step == "await_country":
         return "await_region"
     if step == "await_format":
         if s.get("db_record"):
-            return "await_link"          # known channel skipped the questions
+            return None                  # known channel: format is the first step
         region = s.get("region")
         if region and PP_COUNTRIES_BY_REGION.get(region):
             return "await_country"
         return "await_region"            # region had no country breakdown
     if step == "await_role":
         return "await_format"
-    return "await_link"
+    return None
 
 
 async def pp_send_step(bot: Bot, chat_id: int, s: dict) -> None:
+    """Send a NEW panel for this session and register it under its message id."""
     text, kb = pp_step_view(s)
-    await pp_send_panel(bot, chat_id, s, text, kb, _pp_step_parse_mode(s))
+    await pp_send_panel(bot, chat_id, s, text, kb)
+    pp_sessions[s["panel_msg_id"]] = s
 
 
 async def pp_edit_step(bot: Bot, chat_id: int, s: dict) -> None:
     text, kb = pp_step_view(s)
-    await pp_edit_panel(bot, chat_id, s, text, kb, _pp_step_parse_mode(s))
+    await pp_edit_panel(bot, chat_id, s, text, kb)
 
 
 async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> None:
-    """Validate the pasted link, then branch on whether the channel is in our DB."""
-    s = predict_sessions[user_id]
+    """Validate a pasted link and open a NEW independent panel for that channel.
+
+    Each link gets its own session/panel, so pasting a second link never
+    disturbs the first one — its panel keeps working on its own channel.
+    """
     username = parse_tg_username(text)
     if not username:
         await bot.send_message(chat_id, PPS["bad_link"], parse_mode="HTML")
@@ -714,6 +737,7 @@ async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> Non
         await bot.send_message(chat_id, PPS["not_in_tg"].format(u=username), parse_mode="HTML")
         return
 
+    s = new_predict_session(user_id)
     s["username"] = username
     s["url"] = text.strip()
     s["channel_title"] = info["title"] or f"@{username}"
@@ -731,7 +755,7 @@ async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> Non
         # Otherwise ask the full set: category → region → (country) → format → role.
         s["step"] = "await_category"
     # Reply to the pasted link with a FRESH panel below it — never overwrite the
-    # "send a link" example message. Button steps from here edit this panel.
+    # "send a link" example. Button steps from here edit this panel in place.
     await pp_send_step(bot, chat_id, s)
 
 
@@ -796,6 +820,7 @@ async def on_start(message: Message, bot: Bot) -> None:
 
 @dp.message(Command("creative"))
 async def on_creative(message: Message, bot: Bot) -> None:
+    pp_mode_users.discard(message.from_user.id)   # leave the price-predict flow
     d = new_draft()
     drafts[message.from_user.id] = d
     await send_panel(bot, message.chat.id, d)
@@ -876,11 +901,7 @@ async def on_album_item(message: Message, bot: Bot) -> None:
 @dp.message(F.photo | F.video)
 async def on_single_media(message: Message, bot: Bot) -> None:
     if _pp_active(message.from_user.id):
-        s = predict_sessions[message.from_user.id]
-        await message.answer(
-            PPS["send_link_hint"] if s["step"] == "await_link" else PPS["use_buttons"],
-            parse_mode="HTML",
-        )
+        await message.answer(PPS["send_link_hint"], parse_mode="HTML")
         return
     d = get_draft(message.from_user.id)
     if d["stage"] != "composing":
@@ -916,10 +937,9 @@ async def on_single_media(message: Message, bot: Bot) -> None:
 
 @dp.message(Command("price_predict"))
 async def on_price_predict(message: Message, bot: Bot) -> None:
-    s = new_predict_session()
-    predict_sessions[message.from_user.id] = s
+    pp_mode_users.add(message.from_user.id)
     await message.answer(PPS["intro"])
-    await pp_send_step(bot, message.chat.id, s)
+    await message.answer(PPS["ask_link"], parse_mode="HTML")
 
 
 def _pp_text_filter(message: Message) -> bool:
@@ -928,26 +948,15 @@ def _pp_text_filter(message: Message) -> bool:
 
 @dp.message(F.text, _pp_text_filter)
 async def pp_on_text(message: Message, bot: Bot) -> None:
-    s = predict_sessions[message.from_user.id]
-    if s["step"] == "await_link":
-        await pp_handle_link(bot, message.chat.id, message.from_user.id, message.text)
-        return
-    # Mid-flow the user normally taps buttons — but if they paste another channel
-    # link, switch to it instead of nagging about the buttons. Anything that
-    # isn't a link gets the gentle "use the buttons" hint.
-    if parse_tg_username(message.text):
-        for k in ("username", "url", "channel_title", "bio", "subscribers",
-                  "db_record", "category", "region", "geo", "fmt", "role"):
-            s[k] = None
-        s["step"] = "await_link"
-        await pp_handle_link(bot, message.chat.id, message.from_user.id, message.text)
-    else:
-        await message.answer(PPS["use_buttons"])
+    # In price-predict mode every message is treated as a channel link: each
+    # valid link opens its OWN panel, so pasting a second link leaves the first
+    # panel fully usable. Non-links get the bad-link hint.
+    await pp_handle_link(bot, message.chat.id, message.from_user.id, message.text)
 
 
 @dp.callback_query(F.data.startswith("pp:cat:"))
 async def pp_cb_category(cq: CallbackQuery, bot: Bot) -> None:
-    s = predict_sessions.get(cq.from_user.id)
+    s = pp_session_for(cq)
     await cq.answer()
     if not s or s["step"] != "await_category":
         return
@@ -964,7 +973,7 @@ async def pp_cb_category(cq: CallbackQuery, bot: Bot) -> None:
 
 @dp.callback_query(F.data.startswith("pp:region:"))
 async def pp_cb_region(cq: CallbackQuery, bot: Bot) -> None:
-    s = predict_sessions.get(cq.from_user.id)
+    s = pp_session_for(cq)
     await cq.answer()
     if not s or s["step"] != "await_region":
         return
@@ -987,7 +996,7 @@ async def pp_cb_region(cq: CallbackQuery, bot: Bot) -> None:
 
 @dp.callback_query(F.data.startswith("pp:country:"))
 async def pp_cb_country(cq: CallbackQuery, bot: Bot) -> None:
-    s = predict_sessions.get(cq.from_user.id)
+    s = pp_session_for(cq)
     await cq.answer()
     if not s or s["step"] != "await_country":
         return
@@ -1010,7 +1019,7 @@ async def pp_cb_country(cq: CallbackQuery, bot: Bot) -> None:
 
 @dp.callback_query(F.data.startswith("pp:fmt:"))
 async def pp_cb_format(cq: CallbackQuery, bot: Bot) -> None:
-    s = predict_sessions.get(cq.from_user.id)
+    s = pp_session_for(cq)
     await cq.answer()
     if not s or s["step"] != "await_format":
         return
@@ -1027,7 +1036,7 @@ async def pp_cb_format(cq: CallbackQuery, bot: Bot) -> None:
 
 @dp.callback_query(F.data.startswith("pp:role:"))
 async def pp_cb_role(cq: CallbackQuery, bot: Bot) -> None:
-    s = predict_sessions.get(cq.from_user.id)
+    s = pp_session_for(cq)
     await cq.answer()
     if not s or s["step"] != "await_role":
         return
@@ -1038,17 +1047,13 @@ async def pp_cb_role(cq: CallbackQuery, bot: Bot) -> None:
 
 @dp.callback_query(F.data == "pp:back")
 async def pp_cb_back(cq: CallbackQuery, bot: Bot) -> None:
-    s = predict_sessions.get(cq.from_user.id)
+    s = pp_session_for(cq)
     await cq.answer()
-    if not s or not _pp_active(cq.from_user.id):
+    if not s:
         return
     target = pp_prev_step(s)
-    if target == "await_link":
-        # Going back to the link prompt means picking a different channel —
-        # drop everything we'd learned about the previous one.
-        for k in ("username", "url", "channel_title", "bio", "subscribers",
-                  "db_record", "category", "region", "geo", "fmt", "role"):
-            s[k] = None
+    if target is None:
+        return
     s["step"] = target
     await pp_edit_step(bot, cq.message.chat.id, s)
 
@@ -1056,9 +1061,8 @@ async def pp_cb_back(cq: CallbackQuery, bot: Bot) -> None:
 @dp.callback_query(F.data == "pp:restart")
 async def pp_cb_restart(cq: CallbackQuery, bot: Bot) -> None:
     await cq.answer()
-    s = new_predict_session()
-    predict_sessions[cq.from_user.id] = s
-    await pp_send_step(bot, cq.message.chat.id, s)
+    pp_mode_users.add(cq.from_user.id)
+    await bot.send_message(cq.message.chat.id, PPS["ask_link"], parse_mode="HTML")
 
 
 # --- creative handlers ----------------------------------------------------
@@ -1078,11 +1082,7 @@ async def on_text(message: Message, bot: Bot) -> None:
 @dp.message()
 async def on_unsupported(message: Message, bot: Bot) -> None:
     if _pp_active(message.from_user.id):
-        s = predict_sessions[message.from_user.id]
-        await message.answer(
-            PPS["send_link_hint"] if s["step"] == "await_link" else PPS["use_buttons"],
-            parse_mode="HTML",
-        )
+        await message.answer(PPS["send_link_hint"], parse_mode="HTML")
         return
     d = get_draft(message.from_user.id)
     if d["stage"] != "composing":
