@@ -371,16 +371,19 @@ PP_REGIONS = [
     "Europe", "CIS", "North America", "Latin America", "MENA",
     "Africa", "South Asia", "Asia-Pacific", "Worldwide",
 ]
+# NOTE: keep each list an ODD length. The "Other country in {region}" button is
+# appended as the final cell of the 2-column grid, so an odd country count makes
+# it land in the bottom-RIGHT slot (countries + Other = even → full rows).
 PP_COUNTRIES_BY_REGION = {
-    "Europe": ["UK", "Germany", "France", "Italy", "Spain", "Poland", "Netherlands", "Sweden"],
+    "Europe": ["UK", "Germany", "France", "Italy", "Spain", "Poland", "Netherlands"],
     "CIS": ["Russia", "Ukraine", "Kazakhstan", "Belarus", "Uzbekistan", "Azerbaijan", "Georgia"],
-    "North America": ["USA", "Canada"],
-    "Latin America": ["Brazil", "Mexico", "Argentina", "Colombia", "Chile", "Peru"],
+    "North America": ["USA", "Canada", "Mexico"],
+    "Latin America": ["Brazil", "Argentina", "Colombia", "Chile", "Peru"],
     "MENA": ["UAE", "Saudi Arabia", "Egypt", "Israel", "Turkey", "Qatar", "Morocco"],
-    "Africa": ["Nigeria", "South Africa", "Kenya", "Ghana", "Ethiopia", "Tanzania"],
-    "South Asia": ["India", "Pakistan", "Bangladesh", "Sri Lanka"],
+    "Africa": ["Nigeria", "South Africa", "Kenya", "Ghana", "Ethiopia"],
+    "South Asia": ["India", "Pakistan", "Bangladesh", "Sri Lanka", "Nepal"],
     "Asia-Pacific": ["China", "Japan", "Indonesia", "Vietnam", "Philippines",
-                     "Thailand", "South Korea", "Australia"],
+                     "South Korea", "Australia"],
     # "Worldwide" has no country breakdown — it's the region-wide answer itself.
 }
 PP_FORMATS = ["1/24h", "1/48h", "1/7d", "1/30d"]
@@ -571,7 +574,9 @@ def _pp_grid_kb(items: list[str], prefix: str, per_row: int = 2, back: bool = Fa
 
 
 def pp_country_kb(region: str, back: bool = False) -> InlineKeyboardMarkup:
-    """Countries inside a region, plus a 'whole region' shortcut."""
+    """Countries inside a region in a 2-column grid. "Other country in {region}"
+    is the final grid cell — with an odd country count it lands bottom-right.
+    "All of {region}" stays a full-width row below the grid."""
     countries = PP_COUNTRIES_BY_REGION.get(region, [])
     rows, row = [], []
     for i, c in enumerate(countries):
@@ -579,10 +584,14 @@ def pp_country_kb(region: str, back: bool = False) -> InlineKeyboardMarkup:
         if len(row) == 2:
             rows.append(row)
             row = []
+    # Append "Other" as the next grid cell (not a full-width row).
+    row.append(InlineKeyboardButton(text=f"Other country in {region}", callback_data="pp:country:other"))
+    if len(row) == 2:
+        rows.append(row)
+        row = []
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton(text=f"🌐 All of {region}", callback_data="pp:country:all")])
-    rows.append([InlineKeyboardButton(text="➕ Other country", callback_data="pp:country:other")])
     if back:
         rows.append(_pp_back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
