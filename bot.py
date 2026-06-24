@@ -60,6 +60,9 @@ ALBUM_DEBOUNCE = 1.0  # seconds
 S = {
     "start.intro": (
         "🤖 Бот для тестирования сценариев и сообщений.\n\n"
+        "Доступные флоу:\n"
+        "📤 /creative — собрать и загрузить креатив в канал.\n"
+        "🔮 /price_predict — предсказать цену размещения в любом TG-канале.\n\n"
         "Выберите команду, запускающую флоу."
     ),
     "panel.title": '📤 New creative for kate_test_channel_mar26 (campaign "Ттт")',
@@ -330,6 +333,295 @@ async def show_link_gate(bot: Bot, chat_id: int, d: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Price-predict flow (/price_predict) — a separate conversational flow that
+# estimates the ad-placement price for any public Telegram channel.
+#
+# Telegram forbids a hyphen in command names, so the command is `price_predict`
+# even though the feature is colloquially "price-predict".
+# ---------------------------------------------------------------------------
+
+# Our "database" of known channels. One seeded test channel: pasting a link to
+# it takes the IN-DB branch (we already know its category/country, so we only
+# ask for the placement format + the user's role). Any other real channel takes
+# the NOT-IN-DB branch (we ask category + country + format + role).
+KNOWN_CHANNELS: dict[str, dict] = {
+    "adstail_demo": {
+        "title": "Adstail Demo Channel",
+        "username": "adstail_demo",
+        "category": "Crypto & Web3",
+        "country": "International",
+        "subscribers": 48_000,
+        "cpm_usd": 4.5,
+    },
+}
+
+PP_CATEGORIES = [
+    "News & Politics", "Crypto & Web3", "Tech & IT", "Business & Finance",
+    "Entertainment", "Lifestyle", "Education", "Other",
+]
+PP_COUNTRIES = [
+    "Russia", "USA", "UK", "Germany", "India", "Brazil", "UAE", "International",
+]
+PP_FORMATS = ["1/24h", "1/48h", "1/7d", "1/30d"]
+
+# Toy price model (the real backend doesn't exist yet).
+_FORMAT_MULT = {"1/24h": 1.0, "1/48h": 1.7, "1/7d": 3.8, "1/30d": 9.0}
+_CATEGORY_MULT = {
+    "News & Politics": 1.0, "Crypto & Web3": 1.8, "Tech & IT": 1.4,
+    "Business & Finance": 1.6, "Entertainment": 0.9, "Lifestyle": 1.0,
+    "Education": 1.1, "Other": 1.0,
+}
+_COUNTRY_MULT = {
+    "Russia": 0.8, "USA": 1.8, "UK": 1.5, "Germany": 1.4, "India": 0.6,
+    "Brazil": 0.7, "UAE": 1.6, "International": 1.0,
+}
+
+PPS = {
+    "intro": (
+        "🔮 Price Predict\n\n"
+        "I find or predict the ad-placement price for any public Telegram channel.\n"
+        "Paste a channel link and I'll estimate what a post there costs."
+    ),
+    "ask_link": "🔗 Send a link to the channel (e.g. https://t.me/durov or @durov).",
+    "bad_link": (
+        "🚫 That doesn't look like a Telegram channel link.\n"
+        "Send something like https://t.me/durov or @durov."
+    ),
+    "not_in_tg": (
+        "🔍 I couldn't find @{u} on Telegram.\n"
+        "Double-check the link and try again."
+    ),
+    "send_link_hint": "Please paste a channel link first (e.g. https://t.me/durov).",
+    "use_buttons": "Please use the buttons above to answer 🙂",
+    "cta_owner": (
+        "👑 This is your channel?\n"
+        "Connect {title} on adstail.com to manage placements and earn from your "
+        "audience on autopilot."
+    ),
+    "cta_adv": (
+        "📣 Want to advertise here?\n"
+        "Buy a placement in {title} — and thousands of other channels — on adstail.com."
+    ),
+}
+
+# user_id -> price-predict session dict
+predict_sessions: dict[int, dict] = {}
+
+
+def new_predict_session() -> dict:
+    return {
+        "step": "await_link",   # await_link | await_category | await_country
+                                # | await_format | await_role | done
+        "url": None,
+        "username": None,
+        "channel_title": None,
+        "in_db": False,
+        "db_record": None,
+        "category": None,
+        "country": None,
+        "fmt": None,
+        "role": None,           # owner | advertiser
+        "panel_msg_id": None,
+    }
+
+
+def _pp_active(user_id: int) -> bool:
+    """True while the user is mid-flow (so the creative handlers stand aside)."""
+    s = predict_sessions.get(user_id)
+    return bool(s) and s.get("step") not in (None, "done")
+
+
+# --- link parsing & validation -------------------------------------------
+
+# Public-username links: t.me/<name>, telegram.me/<name>, with optional scheme.
+_TG_LINK_RE = re.compile(
+    r'(?:https?://)?(?:www\.)?t(?:elegram)?\.me/(@?[A-Za-z0-9_]{3,32})', re.IGNORECASE
+)
+_TG_AT_RE = re.compile(r'^@([A-Za-z0-9_]{3,32})$')
+# Slugs that look like usernames but aren't channels (invite/share endpoints).
+_TG_RESERVED = {"joinchat", "s", "c", "addstickers", "share", "proxy"}
+
+
+def parse_tg_username(text: Optional[str]) -> Optional[str]:
+    """Extract a public-channel username (lowercased, no @) from user text."""
+    if not text:
+        return None
+    text = text.strip()
+    m = _TG_AT_RE.match(text)
+    if m:
+        return m.group(1).lower()
+    m = _TG_LINK_RE.search(text)
+    if m:
+        username = m.group(1).lstrip("@").lower()
+        if username in _TG_RESERVED:
+            return None
+        return username
+    return None
+
+
+async def pp_check_tg(bot: Bot, username: str) -> tuple[bool, Optional[str]]:
+    """Best-effort 'does this channel exist on Telegram?' check via get_chat.
+
+    Public channels/users resolve by @username. If Telegram can't resolve it we
+    treat it as non-existent. (Channels we already know from KNOWN_CHANNELS skip
+    this and are always considered to exist.)
+    """
+    try:
+        chat = await bot.get_chat(f"@{username}")
+        title = chat.title or chat.full_name or f"@{username}"
+        return True, title
+    except Exception:  # noqa: BLE001 — network/notfound/forbidden all mean "no"
+        return False, None
+
+
+def predict_price(category: str, country: str, fmt: str, rec: Optional[dict]):
+    """Toy price estimator. Returns (low, high, subscribers|None) in USD."""
+    fmt_mult = _FORMAT_MULT.get(fmt, 1.0)
+    cat_mult = _CATEGORY_MULT.get(category, 1.0)
+    country_mult = _COUNTRY_MULT.get(country, 1.0)
+    if rec:
+        subs = rec["subscribers"]
+        base = subs / 1000 * rec["cpm_usd"]   # CPM-style base for a 1/24h post
+    else:
+        subs = None
+        base = 60.0                            # baseline for an unknown channel
+    price = base * fmt_mult * cat_mult * country_mult
+    low = int(round(price * 0.80 / 5) * 5)
+    high = int(round(price * 1.25 / 5) * 5)
+    return low, high, subs
+
+
+# --- panel rendering ------------------------------------------------------
+
+def _pp_grid_kb(items: list[str], prefix: str, per_row: int = 2) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for i, label in enumerate(items):
+        row.append(InlineKeyboardButton(text=label, callback_data=f"{prefix}{i}"))
+        if len(row) == per_row:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def pp_role_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👑 I own this channel", callback_data="pp:role:owner")],
+        [InlineKeyboardButton(text="📣 I want to advertise", callback_data="pp:role:adv")],
+    ])
+
+
+def pp_header(s: dict) -> str:
+    lines = [f"📡 {s['channel_title']}  (@{s['username']})"]
+    lines.append(
+        "✅ Found in the Adstail database" if s["in_db"]
+        else "🆕 New channel — not in our database yet"
+    )
+    facts = []
+    if s.get("category"):
+        facts.append(f"🏷 {s['category']}")
+    if s.get("country"):
+        facts.append(f"🌍 {s['country']}")
+    if facts:
+        lines.append(" · ".join(facts))
+    return "\n".join(lines)
+
+
+def pp_category_q(s: dict) -> str:
+    return pp_header(s) + "\n\nStep 1 of 3 — pick the channel category:"
+
+
+def pp_country_q(s: dict) -> str:
+    return pp_header(s) + "\n\nStep 2 of 3 — pick the main audience country (or International):"
+
+
+def pp_format_q(s: dict) -> str:
+    label = "Pick the placement format:" if s["in_db"] else "Step 3 of 3 — pick the placement format:"
+    return pp_header(s) + "\n\n" + label
+
+
+def pp_role_q(s: dict) -> str:
+    return pp_header(s) + "\n\nLast one — why are you checking this price?"
+
+
+async def pp_send_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: InlineKeyboardMarkup) -> None:
+    msg = await bot.send_message(chat_id, text, reply_markup=kb)
+    s["panel_msg_id"] = msg.message_id
+
+
+async def pp_edit_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: InlineKeyboardMarkup) -> None:
+    if s.get("panel_msg_id") is None:
+        await pp_send_panel(bot, chat_id, s, text, kb)
+        return
+    try:
+        await bot.edit_message_text(
+            text=text, chat_id=chat_id, message_id=s["panel_msg_id"], reply_markup=kb
+        )
+    except TelegramBadRequest:
+        pass
+
+
+async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> None:
+    """Validate the pasted link, then branch on whether the channel is in our DB."""
+    s = predict_sessions[user_id]
+    username = parse_tg_username(text)
+    if not username:
+        await bot.send_message(chat_id, PPS["bad_link"])
+        return
+
+    rec = KNOWN_CHANNELS.get(username)
+    if rec:
+        in_tg, title = True, rec["title"]   # known to us ⇒ treat as existing
+    else:
+        in_tg, title = await pp_check_tg(bot, username)
+    if not in_tg:
+        await bot.send_message(chat_id, PPS["not_in_tg"].format(u=username))
+        return
+
+    s["username"] = username
+    s["url"] = text.strip()
+    s["channel_title"] = title or f"@{username}"
+
+    if rec:
+        # In our DB: category/country already known → ask format, then role.
+        s["in_db"] = True
+        s["db_record"] = rec
+        s["category"] = rec["category"]
+        s["country"] = rec["country"]
+        s["step"] = "await_format"
+        await pp_send_panel(bot, chat_id, s, pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:"))
+    else:
+        # New channel: ask the full set of questions.
+        s["in_db"] = False
+        s["step"] = "await_category"
+        await pp_send_panel(bot, chat_id, s, pp_category_q(s), _pp_grid_kb(PP_CATEGORIES, "pp:cat:"))
+
+
+async def pp_show_result(bot: Bot, chat_id: int, s: dict) -> None:
+    """Pretend to call the (non-existent) pricing backend and render the result."""
+    low, high, subs = predict_price(s["category"], s["country"], s["fmt"], s.get("db_record"))
+    lines = [
+        "🔮 Price prediction",
+        "",
+        f"📡 Channel: {s['channel_title']} (@{s['username']})",
+        f"🏷 Category: {s['category']}",
+        f"🌍 Country: {s['country']}",
+        f"🗓 Format: {s['fmt']}",
+    ]
+    if subs:
+        lines.append(f"👥 Audience: {subs:,} subscribers")
+    lines += ["", f"💰 Estimated price: ${low:,}–${high:,} per post", ""]
+    lines.append(PPS["cta_owner" if s["role"] == "owner" else "cta_adv"].format(title=s["channel_title"]))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Open adstail.com", url="https://adstail.com")],
+        [InlineKeyboardButton(text="↻ Predict another channel", callback_data="pp:restart")],
+    ])
+    await pp_edit_panel(bot, chat_id, s, "\n".join(lines), kb)
+
+
+# ---------------------------------------------------------------------------
 # Bot / Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -404,6 +696,8 @@ async def flush_album(bot: Bot, chat_id: int, user_id: int) -> None:
 
 @dp.message(F.media_group_id, F.photo | F.video)
 async def on_album_item(message: Message, bot: Bot) -> None:
+    if _pp_active(message.from_user.id):
+        return
     d = get_draft(message.from_user.id)
     if d["stage"] != "composing":
         return
@@ -438,6 +732,10 @@ async def on_album_item(message: Message, bot: Bot) -> None:
 
 @dp.message(F.photo | F.video)
 async def on_single_media(message: Message, bot: Bot) -> None:
+    if _pp_active(message.from_user.id):
+        s = predict_sessions[message.from_user.id]
+        await message.answer(PPS["send_link_hint"] if s["step"] == "await_link" else PPS["use_buttons"])
+        return
     d = get_draft(message.from_user.id)
     if d["stage"] != "composing":
         return
@@ -466,6 +764,102 @@ async def on_single_media(message: Message, bot: Bot) -> None:
     await refresh_panel(bot, message.chat.id, d)
 
 
+# --- price-predict handlers ----------------------------------------------
+# Registered ABOVE the generic creative handlers so an active session captures
+# the user's text before on_text can treat it as a creative caption.
+
+@dp.message(Command("price_predict"))
+async def on_price_predict(message: Message, bot: Bot) -> None:
+    predict_sessions[message.from_user.id] = new_predict_session()
+    await message.answer(PPS["intro"])
+    await message.answer(PPS["ask_link"])
+
+
+def _pp_text_filter(message: Message) -> bool:
+    return _pp_active(message.from_user.id)
+
+
+@dp.message(F.text, _pp_text_filter)
+async def pp_on_text(message: Message, bot: Bot) -> None:
+    s = predict_sessions[message.from_user.id]
+    if s["step"] == "await_link":
+        await pp_handle_link(bot, message.chat.id, message.from_user.id, message.text)
+    else:
+        # Mid-flow we expect button taps, not free text.
+        await message.answer(PPS["use_buttons"])
+
+
+@dp.callback_query(F.data.startswith("pp:cat:"))
+async def pp_cb_category(cq: CallbackQuery, bot: Bot) -> None:
+    s = predict_sessions.get(cq.from_user.id)
+    await cq.answer()
+    if not s or s["step"] != "await_category":
+        return
+    try:
+        idx = int(cq.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    if not 0 <= idx < len(PP_CATEGORIES):
+        return
+    s["category"] = PP_CATEGORIES[idx]
+    s["step"] = "await_country"
+    await pp_edit_panel(bot, cq.message.chat.id, s, pp_country_q(s), _pp_grid_kb(PP_COUNTRIES, "pp:country:"))
+
+
+@dp.callback_query(F.data.startswith("pp:country:"))
+async def pp_cb_country(cq: CallbackQuery, bot: Bot) -> None:
+    s = predict_sessions.get(cq.from_user.id)
+    await cq.answer()
+    if not s or s["step"] != "await_country":
+        return
+    try:
+        idx = int(cq.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    if not 0 <= idx < len(PP_COUNTRIES):
+        return
+    s["country"] = PP_COUNTRIES[idx]
+    s["step"] = "await_format"
+    await pp_edit_panel(bot, cq.message.chat.id, s, pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:"))
+
+
+@dp.callback_query(F.data.startswith("pp:fmt:"))
+async def pp_cb_format(cq: CallbackQuery, bot: Bot) -> None:
+    s = predict_sessions.get(cq.from_user.id)
+    await cq.answer()
+    if not s or s["step"] != "await_format":
+        return
+    try:
+        idx = int(cq.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    if not 0 <= idx < len(PP_FORMATS):
+        return
+    s["fmt"] = PP_FORMATS[idx]
+    s["step"] = "await_role"
+    await pp_edit_panel(bot, cq.message.chat.id, s, pp_role_q(s), pp_role_kb())
+
+
+@dp.callback_query(F.data.startswith("pp:role:"))
+async def pp_cb_role(cq: CallbackQuery, bot: Bot) -> None:
+    s = predict_sessions.get(cq.from_user.id)
+    await cq.answer()
+    if not s or s["step"] != "await_role":
+        return
+    s["role"] = "owner" if cq.data.endswith("owner") else "advertiser"
+    s["step"] = "done"
+    await pp_show_result(bot, cq.message.chat.id, s)
+
+
+@dp.callback_query(F.data == "pp:restart")
+async def pp_cb_restart(cq: CallbackQuery, bot: Bot) -> None:
+    await cq.answer()
+    predict_sessions[cq.from_user.id] = new_predict_session()
+    await bot.send_message(cq.message.chat.id, PPS["ask_link"])
+
+
+# --- creative handlers ----------------------------------------------------
+
 @dp.message(F.text)
 async def on_text(message: Message, bot: Bot) -> None:
     d = get_draft(message.from_user.id)
@@ -480,6 +874,10 @@ async def on_text(message: Message, bot: Bot) -> None:
 
 @dp.message()
 async def on_unsupported(message: Message, bot: Bot) -> None:
+    if _pp_active(message.from_user.id):
+        s = predict_sessions[message.from_user.id]
+        await message.answer(PPS["send_link_hint"] if s["step"] == "await_link" else PPS["use_buttons"])
+        return
     d = get_draft(message.from_user.id)
     if d["stage"] != "composing":
         return
@@ -655,6 +1053,7 @@ async def main() -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="creative", description="тест флоу добавления креатива"),
+            BotCommand(command="price_predict", description="предсказать цену размещения в канале"),
         ]
     )
     # Make the chat "Menu" button open the commands list.
