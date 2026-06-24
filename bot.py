@@ -371,19 +371,20 @@ PP_REGIONS = [
     "Europe", "CIS", "North America", "Latin America", "MENA",
     "Africa", "South Asia", "Asia-Pacific", "Worldwide",
 ]
-# NOTE: keep each list an ODD length. The "Other country in {region}" button is
-# appended as the final cell of the 2-column grid, so an odd country count makes
-# it land in the bottom-RIGHT slot (countries + Other = even → full rows).
+# Countries are ordered by approximate DIGITAL AD-SPEND (largest market first),
+# from general eMarketer/Statista-style rankings — not a live dataset, figures
+# shift yearly. Each list is kept ODD-length so the appended "Other country in
+# {region}" cell lands in the bottom-RIGHT slot of the 2-column grid.
 PP_COUNTRIES_BY_REGION = {
-    "Europe": ["UK", "Germany", "France", "Italy", "Spain", "Poland", "Netherlands"],
-    "CIS": ["Russia", "Ukraine", "Kazakhstan", "Belarus", "Uzbekistan", "Azerbaijan", "Georgia"],
+    "Europe": ["UK", "Germany", "France", "Italy", "Spain", "Netherlands", "Sweden"],
+    "CIS": ["Russia", "Ukraine", "Kazakhstan", "Uzbekistan", "Azerbaijan", "Belarus", "Georgia"],
     "North America": ["USA", "Canada", "Mexico"],
     "Latin America": ["Brazil", "Argentina", "Colombia", "Chile", "Peru"],
-    "MENA": ["UAE", "Saudi Arabia", "Egypt", "Israel", "Turkey", "Qatar", "Morocco"],
-    "Africa": ["Nigeria", "South Africa", "Kenya", "Ghana", "Ethiopia"],
+    "MENA": ["Saudi Arabia", "UAE", "Turkey", "Israel", "Egypt", "Qatar", "Morocco"],
+    "Africa": ["South Africa", "Nigeria", "Kenya", "Ghana", "Ethiopia"],
     "South Asia": ["India", "Pakistan", "Bangladesh", "Sri Lanka", "Nepal"],
-    "Asia-Pacific": ["China", "Japan", "Indonesia", "Vietnam", "Philippines",
-                     "South Korea", "Australia"],
+    "Asia-Pacific": ["China", "Japan", "Australia", "South Korea", "Indonesia",
+                     "Vietnam", "Philippines"],
     # "Worldwide" has no country breakdown — it's the region-wide answer itself.
 }
 PP_FORMATS = ["1/24h", "1/48h", "1/7d", "1/30d"]
