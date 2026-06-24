@@ -921,8 +921,17 @@ async def pp_on_text(message: Message, bot: Bot) -> None:
     s = predict_sessions[message.from_user.id]
     if s["step"] == "await_link":
         await pp_handle_link(bot, message.chat.id, message.from_user.id, message.text)
+        return
+    # Mid-flow the user normally taps buttons — but if they paste another channel
+    # link, switch to it instead of nagging about the buttons. Anything that
+    # isn't a link gets the gentle "use the buttons" hint.
+    if parse_tg_username(message.text):
+        for k in ("username", "url", "channel_title", "bio", "subscribers",
+                  "db_record", "category", "region", "geo", "fmt", "role"):
+            s[k] = None
+        s["step"] = "await_link"
+        await pp_handle_link(bot, message.chat.id, message.from_user.id, message.text)
     else:
-        # Mid-flow we expect button taps, not free text.
         await message.answer(PPS["use_buttons"])
 
 
