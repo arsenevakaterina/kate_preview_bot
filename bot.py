@@ -421,6 +421,7 @@ PPS = {
     ),
     "send_link_hint": "Please paste a channel link first (e.g. https://t.me/durov).",
     "use_buttons": "Please use the buttons above to answer 🙂",
+    "closed": "👋 Closed. Send /price_predict whenever you want another estimate.",
     "cta_owner": (
         "👑 This is your channel?\n"
         "Connect {title} on adstail.com to manage placements and earn from your "
@@ -527,7 +528,11 @@ def predict_price(category: str, geo: str, fmt: str,
 
 # --- panel rendering ------------------------------------------------------
 
-def _pp_grid_kb(items: list[str], prefix: str, per_row: int = 2) -> InlineKeyboardMarkup:
+def _pp_back_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="↩️ Back", callback_data="pp:back")]
+
+
+def _pp_grid_kb(items: list[str], prefix: str, per_row: int = 2, back: bool = False) -> InlineKeyboardMarkup:
     rows, row = [], []
     for i, label in enumerate(items):
         row.append(InlineKeyboardButton(text=label, callback_data=f"{prefix}{i}"))
@@ -536,10 +541,12 @@ def _pp_grid_kb(items: list[str], prefix: str, per_row: int = 2) -> InlineKeyboa
             row = []
     if row:
         rows.append(row)
+    if back:
+        rows.append(_pp_back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def pp_country_kb(region: str) -> InlineKeyboardMarkup:
+def pp_country_kb(region: str, back: bool = False) -> InlineKeyboardMarkup:
     """Countries inside a region, plus a 'whole region' shortcut."""
     countries = PP_COUNTRIES_BY_REGION.get(region, [])
     rows, row = [], []
@@ -551,14 +558,19 @@ def pp_country_kb(region: str) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton(text=f"🌐 All of {region}", callback_data="pp:country:all")])
+    if back:
+        rows.append(_pp_back_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def pp_role_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def pp_role_kb(back: bool = False) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton(text="👑 I run this channel", callback_data="pp:role:owner")],
         [InlineKeyboardButton(text="📣 I'm looking to advertise", callback_data="pp:role:adv")],
-    ])
+    ]
+    if back:
+        rows.append(_pp_back_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _clip(text: str, limit: int = 140) -> str:
@@ -612,7 +624,7 @@ async def pp_send_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: InlineKe
     s["panel_msg_id"] = msg.message_id
 
 
-async def pp_edit_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: InlineKeyboardMarkup) -> None:
+async def pp_edit_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: Optional[InlineKeyboardMarkup]) -> None:
     if s.get("panel_msg_id") is None:
         await pp_send_panel(bot, chat_id, s, text, kb)
         return
@@ -622,6 +634,61 @@ async def pp_edit_panel(bot: Bot, chat_id: int, s: dict, text: str, kb: InlineKe
         )
     except TelegramBadRequest:
         pass
+
+
+# --- step rendering & navigation -----------------------------------------
+# Every step renders onto the SAME panel. The first step (await_link) carries a
+# full Exit; every later step carries a Back to the previous step.
+
+def pp_step_view(s: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """(text, keyboard) for the session's current step."""
+    step = s["step"]
+    if step == "await_category":
+        return pp_category_q(s), _pp_grid_kb(PP_CATEGORIES, "pp:cat:", back=True)
+    if step == "await_region":
+        return pp_region_q(s), _pp_grid_kb(PP_REGIONS, "pp:region:", back=True)
+    if step == "await_country":
+        return pp_country_q(s), pp_country_kb(s.get("region"), back=True)
+    if step == "await_format":
+        return pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:", back=True)
+    if step == "await_role":
+        return pp_role_q(s), pp_role_kb(back=True)
+    # await_link (and any fallback): just the prompt + a full Exit.
+    exit_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✖️ Exit", callback_data="pp:exit")],
+    ])
+    return PPS["ask_link"], exit_kb
+
+
+def pp_prev_step(s: dict) -> str:
+    """Where Back goes from the current step."""
+    step = s["step"]
+    if step == "await_category":
+        return "await_link"
+    if step == "await_region":
+        return "await_category"
+    if step == "await_country":
+        return "await_region"
+    if step == "await_format":
+        if s.get("db_record"):
+            return "await_link"          # known channel skipped the questions
+        region = s.get("region")
+        if region and PP_COUNTRIES_BY_REGION.get(region):
+            return "await_country"
+        return "await_region"            # region had no country breakdown
+    if step == "await_role":
+        return "await_format"
+    return "await_link"
+
+
+async def pp_send_step(bot: Bot, chat_id: int, s: dict) -> None:
+    text, kb = pp_step_view(s)
+    await pp_send_panel(bot, chat_id, s, text, kb)
+
+
+async def pp_edit_step(bot: Bot, chat_id: int, s: dict) -> None:
+    text, kb = pp_step_view(s)
+    await pp_edit_panel(bot, chat_id, s, text, kb)
 
 
 async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> None:
@@ -655,11 +722,10 @@ async def pp_handle_link(bot: Bot, chat_id: int, user_id: int, text: str) -> Non
         s["region"] = rec.get("region")
         s["geo"] = rec["geo"]
         s["step"] = "await_format"
-        await pp_send_panel(bot, chat_id, s, pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:"))
     else:
         # Otherwise ask the full set: category → region → (country) → format → role.
         s["step"] = "await_category"
-        await pp_send_panel(bot, chat_id, s, pp_category_q(s), _pp_grid_kb(PP_CATEGORIES, "pp:cat:"))
+    await pp_edit_step(bot, chat_id, s)
 
 
 async def pp_show_result(bot: Bot, chat_id: int, s: dict) -> None:
@@ -840,9 +906,10 @@ async def on_single_media(message: Message, bot: Bot) -> None:
 
 @dp.message(Command("price_predict"))
 async def on_price_predict(message: Message, bot: Bot) -> None:
-    predict_sessions[message.from_user.id] = new_predict_session()
+    s = new_predict_session()
+    predict_sessions[message.from_user.id] = s
     await message.answer(PPS["intro"])
-    await message.answer(PPS["ask_link"])
+    await pp_send_step(bot, message.chat.id, s)
 
 
 def _pp_text_filter(message: Message) -> bool:
@@ -873,7 +940,7 @@ async def pp_cb_category(cq: CallbackQuery, bot: Bot) -> None:
         return
     s["category"] = PP_CATEGORIES[idx]
     s["step"] = "await_region"
-    await pp_edit_panel(bot, cq.message.chat.id, s, pp_region_q(s), _pp_grid_kb(PP_REGIONS, "pp:region:"))
+    await pp_edit_step(bot, cq.message.chat.id, s)
 
 
 @dp.callback_query(F.data.startswith("pp:region:"))
@@ -894,10 +961,9 @@ async def pp_cb_region(cq: CallbackQuery, bot: Bot) -> None:
         # Region with no country breakdown (e.g. Worldwide) is a complete answer.
         s["geo"] = region
         s["step"] = "await_format"
-        await pp_edit_panel(bot, cq.message.chat.id, s, pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:"))
     else:
         s["step"] = "await_country"
-        await pp_edit_panel(bot, cq.message.chat.id, s, pp_country_q(s), pp_country_kb(region))
+    await pp_edit_step(bot, cq.message.chat.id, s)
 
 
 @dp.callback_query(F.data.startswith("pp:country:"))
@@ -920,7 +986,7 @@ async def pp_cb_country(cq: CallbackQuery, bot: Bot) -> None:
             return
         s["geo"] = countries[idx]
     s["step"] = "await_format"
-    await pp_edit_panel(bot, cq.message.chat.id, s, pp_format_q(s), _pp_grid_kb(PP_FORMATS, "pp:fmt:"))
+    await pp_edit_step(bot, cq.message.chat.id, s)
 
 
 @dp.callback_query(F.data.startswith("pp:fmt:"))
@@ -937,7 +1003,7 @@ async def pp_cb_format(cq: CallbackQuery, bot: Bot) -> None:
         return
     s["fmt"] = PP_FORMATS[idx]
     s["step"] = "await_role"
-    await pp_edit_panel(bot, cq.message.chat.id, s, pp_role_q(s), pp_role_kb())
+    await pp_edit_step(bot, cq.message.chat.id, s)
 
 
 @dp.callback_query(F.data.startswith("pp:role:"))
@@ -951,11 +1017,45 @@ async def pp_cb_role(cq: CallbackQuery, bot: Bot) -> None:
     await pp_show_result(bot, cq.message.chat.id, s)
 
 
+@dp.callback_query(F.data == "pp:back")
+async def pp_cb_back(cq: CallbackQuery, bot: Bot) -> None:
+    s = predict_sessions.get(cq.from_user.id)
+    await cq.answer()
+    if not s or not _pp_active(cq.from_user.id):
+        return
+    target = pp_prev_step(s)
+    if target == "await_link":
+        # Going back to the link prompt means picking a different channel —
+        # drop everything we'd learned about the previous one.
+        for k in ("username", "url", "channel_title", "bio", "subscribers",
+                  "db_record", "category", "region", "geo", "fmt", "role"):
+            s[k] = None
+    s["step"] = target
+    await pp_edit_step(bot, cq.message.chat.id, s)
+
+
+@dp.callback_query(F.data == "pp:exit")
+async def pp_cb_exit(cq: CallbackQuery, bot: Bot) -> None:
+    s = predict_sessions.get(cq.from_user.id)
+    await cq.answer()
+    predict_sessions.pop(cq.from_user.id, None)
+    chat_id = cq.message.chat.id
+    panel_id = s.get("panel_msg_id") if s else None
+    if panel_id is not None:
+        try:
+            await bot.edit_message_text(text=PPS["closed"], chat_id=chat_id, message_id=panel_id, reply_markup=None)
+            return
+        except TelegramBadRequest:
+            pass
+    await bot.send_message(chat_id, PPS["closed"])
+
+
 @dp.callback_query(F.data == "pp:restart")
 async def pp_cb_restart(cq: CallbackQuery, bot: Bot) -> None:
     await cq.answer()
-    predict_sessions[cq.from_user.id] = new_predict_session()
-    await bot.send_message(cq.message.chat.id, PPS["ask_link"])
+    s = new_predict_session()
+    predict_sessions[cq.from_user.id] = s
+    await pp_send_step(bot, cq.message.chat.id, s)
 
 
 # --- creative handlers ----------------------------------------------------
